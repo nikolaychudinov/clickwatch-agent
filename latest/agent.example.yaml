@@ -1,0 +1,80 @@
+# Пример agent.yaml (формат agent.yaml). Секреты — только ссылками (api_key_ref).
+schema_version: 1
+
+identity:
+  agent_version: "1.2.0"
+  tenant_id: "example"
+  # fleet-соль для bootstrap-подписи (агенты БЕЗ per-client config.yaml);
+  # если заполнен config.yaml с client_salt — этот ключ не используется
+  api_key_ref: "env:CH_AGENT_API_KEY"
+  insecure_skip_verify: false
+
+node:
+  hostname: "ch-node-01"
+  fqdn: "ch-node-01.example.org"
+  primary_ip: "10.0.3.11"
+  ip_addresses: ["10.0.3.11", "172.17.0.1"]
+  os_name: "Ubuntu"
+  os_version: "22.04 LTS"
+  kernel: "5.15.0-91-generic"
+  cpu_cores: 32
+  ram_bytes: 268435456000
+  disks_count: 4
+  timezone: "Europe/Moscow"
+
+clickhouse:
+  version: "25.3.3.42"          # фактическая всё равно читается probe-запросом
+  distribution: oss
+  install_type: deb
+  cluster_names: ["prod-cluster"]
+  replication_mode: replicated   # самодетект перекроет, если задан пустым
+  tcp_port: 9000
+  http_port: 8123
+  user: "chwatch_ro"
+  password_env: "CH_AGENT_PASSWORD"
+  connection_timeout: 2s
+
+send:
+  endpoint_base: "https://agent.clickwatch.ru/monitoring"
+  http_timeout: 10s
+  flush_interval: 30s
+  batch_max_results: 50
+  batch_max_bytes: 1048576
+
+sync:
+  channel: stable
+  poll_interval: 15m
+  cache_ttl_on_failure: 5m
+  max_dataset_age: 600h
+
+status:
+  poll_interval: 15m
+  cache_state: 24h
+
+behavior:
+  ch_probe_query: "SELECT 1"
+  ch_probe_interval: 10s
+  ch_backoff_initial: 10s
+  ch_backoff_multiplier: 2.0
+  ch_backoff_max: 15m
+  unreachable_alert_repeat: 1h
+  access_recheck_interval: 30m
+  access_alert_mode: on_change
+
+storage:
+  state_file: "/var/lib/ch-agent/state.json"
+  rules_dir: "/etc/ch-agent/"
+  buffer_dir: "/var/lib/ch-agent/buffer/"
+  buffer_max_bytes: 536870912
+  log_level: info
+
+limits:
+  max_concurrent_queries: 2
+  max_threads_per_query: 2
+  daily_query_budget: 20000      # полный встроенный набор исполняется чаще дефолтных 2000
+  min_ch_version: "21.8"
+
+labels:
+  env: prod
+  dc: dc1
+  service: bi

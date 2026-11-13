@@ -1,0 +1,27 @@
+# client.example.yaml — per-client provisioning-файл ноды
+# (обычное имя: config.yaml).
+#
+# Один файл на ноду, заполняется при подключении клиента.
+# Значения client_id и client_salt выдаёт служба поддержки ClickWatch
+# при подключении и они должны совпадать с парой, зарегистрированной
+# на сервере ClickWatch.
+#
+# Агент читает файл при старте, если он лежит рядом с agent.yaml
+# (или передан через -client-config <путь>): эти значения подписывают
+# все запросы заголовками X-Client-Id и
+# X-Client-Hash = HMAC-SHA256(client_salt, client_id).
+#
+# Файл — секрет: хранить с правами доступа 0600, в git не выкладывать.
+
+client_id: "ВПИШИТЕ-ВЫДАННЫЙ-ID"
+client_salt: "ВПИШИТЕ-ВЫДАННУЮ-СОЛЬ"
+
+# Реквизиты подключения агента к ноде ClickHouse (заполненные поля
+# перекрывают agent.yaml; пароль — по ссылке на переменную окружения).
+clickhouse:
+  host: "127.0.0.1"
+  http_port: 8123
+  tcp_port: 9000
+  user: "chwatch_ro"
+  password_env: "CH_AGENT_PASSWORD"
+  # connection_timeout: 5s

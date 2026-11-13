@@ -1,0 +1,2135 @@
+# ============================================================================
+# ch-agent - встроенный (embedded) каталог правил мониторинга ClickHouse
+# Слой 1 из 3: //go:embed (этот файл компилируется в бинарник).
+# dataset_version: 0 - базовый fallback; слой SaaS всегда новее.
+# Формат полей и механика слияния слоёв: см. описание формата правил (в README репозитория)
+# Идентификаторы: uid - стабильный ключ (не менять никогда);
+#                 id  - номер пункта администраторского чек-листа ClickWatch
+# Правила id 44-46 - расширение за пределами чек-листа (реестр метрик ClickWatch:
+# host-телеметрия, снимок счётчиков, статус Keeper-соединения).
+# Все запросы - ТОЛЬКО к локальным системным таблицам ноды (без clusterAllReplicas).
+# Кросс-нодовые сравнения делает SaaS (scope: saas).
+# ============================================================================
+
+schema_version: 1
+dataset_uid: "ch-monitor-rules"
+dataset_version: 0
+# hash пересчитывается пайплайном сборки и агентом после embed:
+dataset_hash: "sha256:computed_at_build"
+released_at: "2026-11-04"
+channel: stable
+min_agent_version: "1.2.0"
+
+defaults:
+  interval: 5m
+  jitter: 30s
+  execution_timeout: 15s
+  max_rows_per_rule: 10
+  max_cell_bytes: 4096
+  query_settings: "max_threads=2"
+
+rules:
+  # --------------------------------------------------------------------------
+  # Блок A. Мутации и репликация (чек-лист 1-6)
+  # --------------------------------------------------------------------------
+
+  - id: 1
+    uid: "ch.mutations.active_summary"
+    title_en: "Active Mutations Summary"
+    title_ru: "Активные мутации (сводка по ноде)"
+    group: mutations_replication
+    priority: P1
+    applies_to: [standalone, replicated]
+    scope: node
+    tables: [system.mutations, system.merges]
+    since: "20.4"
+    interval: 5m
+    query: |
+      SELECT
+        countIf(NOT is_done AND create_time >= now() - INTERVAL 1 DAY)          AS active_mutations_24h,
+        round(maxIf((now() - create_time) / 3600, NOT is_done), 1)              AS oldest_running_hours,
+        maxIf(parts_to_do, NOT is_done)                                         AS max_parts_to_do,
+        toUInt64((SELECT count() FROM system.merges WHERE is_mutation = 1))     AS running_merges_control
+      FROM system.mutations
+    thresholds:
+      - { metric: active_mutations_24h, op: gte, value: 1,  severity: warning }
+      - { metric: active_mutations_24h, op: gte, value: 10, severity: critical }
+      - { metric: oldest_running_hours, op: gte, value: 6,  severity: warning }
+      - { metric: oldest_running_hours, op: gte, value: 12, severity: critical }
+    threshold_version: 2
+    thresholds_updated_at: "2026-10-28T00:00:00Z"
+    thresholds_source: builtin
+    unit_map: { oldest_running_hours: hours, max_parts_to_do: count, running_merges_control: count }
+    owner: "clickwatch"
+    labels: [P1, mutations, daily]
+    notes: >-
+      Чек-лист п.1. Число незавершённых мутаций за последние 24 ч (окно свежести),
+      возраст самой старшей и объём оставшейся работы (parts_to_do).
+      running_merges_control - контрольная колонка из merges (is_mutation=1, семантика №68 реестра
+      ClickWatch): очередь мутаций (system.mutations) и исполняющиеся мутации (merges) различаются,
+      обе величины нужны (реестр метрик ClickWatch §12.4).
+
+  - id: 2
+    uid: "ch.mutations.failed"
+    title_en: "Failed Mutations"
+    title_ru: "Падающие мутации"
+    group: mutations_replication
+    priority: P1
+    applies_to: [standalone, replicated]
+    scope: node
+    tables: [system.mutations]
+    since: "20.4"
+    interval: 5m
+    query: |
+      SELECT
+        count()                AS failed_mutations,
+        toUInt64(max(latest_fail_count)) AS fail_retries
+      FROM system.mutations
+      WHERE is_done = 0
+        AND length(latest_fail_reason) > 0
+        AND create_time >= now() - INTERVAL 1 DAY
+    thresholds:
+      - { metric: failed_mutations, op: gte, value: 1, severity: critical }
+      - { metric: fail_retries,     op: gte, value: 3, severity: warning }
+    threshold_version: 1
+    thresholds_updated_at: "2026-10-28T00:00:00Z"
+    thresholds_source: builtin
+    unit_map: { failed_mutations: count, fail_retries: count }
+    owner: "clickwatch"
+    labels: [P1, mutations, daily]
+    notes: >-
+      Чек-лист п.2. Упавшая мутация повторяется бесконечно и мешает удалению старых частей.
+      В 25.5+ часть лёгких DELETE/UPDATE (patch parts) в system.mutations не видна - правило
+      следует дополнять данными о lightweight-операциях на стороне SaaS.
+
+  - id: 3
+    uid: "ch.mutations.replica_skew"
+    title_en: "Replication Skew on Mutations"
+    title_ru: "Расхождение реплик по мутациям"
+    group: mutations_replication
+    priority: P1
+    applies_to: [replicated]
+    scope: saas
+    tables: [system.mutations]
+    since: "20.4"
+    interval: 15m
+    max_rows_per_rule: 50
+    query: |
+      SELECT
+        database, `table`, mutation_id, is_done, parts_to_do,
+        hostname() AS hostname
+      FROM system.mutations
+      WHERE create_time >= now() - INTERVAL 1 DAY
+    thresholds: []
+    threshold_version: 1
+    thresholds_updated_at: "2026-10-28T00:00:00Z"
+    thresholds_source: builtin
+    unit_map: { parts_to_do: count }
+    owner: "clickwatch"
+    labels: [P1, mutations, daily]
+    notes: >-
+      Чек-лист п.3. Покрытие мутаций по репликам сравнивается на стороне SaaS:
+      узел-аутсайдер по is_done/parts_to_do свидетельствует об отставании реплики.
+
+  - id: 4
+    uid: "ch.replication_queue.backlog"
+    title_en: "Replication Queue Backlog"
+    title_ru: "Backlog очереди репликации (MUTATE_PART)"
+    group: mutations_replication
+    priority: P1
+    applies_to: [replicated]
+    scope: node
+    tables: [system.replication_queue, system.replicas]
+    since: "20.4"
+    interval: 2m
+    query: |
+      SELECT
+        countIf(type = 'MUTATE_PART')                                AS mutate_tasks,
+        minIf(intDiv(now() - create_time, 60), type = 'MUTATE_PART') AS oldest_mutate_min,
+        toUInt64((SELECT max(queue_size) FROM system.replicas))      AS replicas_max_queue_size
+      FROM system.replication_queue
+      WHERE create_time >= now() - INTERVAL 1 DAY
+    thresholds:
+      - { metric: mutate_tasks,     op: gte, value: 100, severity: warning }
+      - { metric: mutate_tasks,     op: gte, value: 500, severity: critical }
+      - { metric: oldest_mutate_min, op: gte, value: 30,  severity: warning }
+      - { metric: oldest_mutate_min, op: gte, value: 120, severity: critical }
+    threshold_version: 2
+    thresholds_updated_at: "2026-10-28T00:00:00Z"
+    thresholds_source: builtin
+    unit_map: { mutate_tasks: count, oldest_mutate_min: minutes, replicas_max_queue_size: count }
+    owner: "clickwatch"
+    labels: [P1, mutations, daily]
+    notes: >-
+      Чек-лист п.4. Копящиеся задачи MUTATE_PART означают, что реплика не справляется.
+
+  - id: 5
+    uid: "ch.replicas.queue_imbalance"
+    title_en: "Queue Load Imbalance"
+    title_ru: "Дисбаланс очередей реплик"
+    group: mutations_replication
+    priority: P1
+    applies_to: [replicated]
+    scope: saas
+    tables: [system.replicas]
+    interval: 15m
+    max_rows_per_rule: 50
+    query: |
+      SELECT
+        database, `table`, queue_size, inserts_in_queue, merges_in_queue,
+        part_mutations_in_queue, hostname() AS hostname
+      FROM system.replicas
+    thresholds: []
+    threshold_version: 1
+    thresholds_updated_at: "2026-10-28T00:00:00Z"
+    thresholds_source: builtin
+    unit_map: { queue_size: count, inserts_in_queue: count, merges_in_queue: count,
+                part_mutations_in_queue: count }
+    owner: "clickwatch"
+    labels: [P1, replication, daily]
+    notes: >-
+      Чек-лист п.5. SaaS считается max/min queue_size между нодами кластера (> 5x - тревога).
+
+  - id: 6
+    uid: "ch.mutations.pileup"
+    title_en: "Mutation Pile-up vs Limits"
+    title_ru: "Накопление мутаций против лимитов"
+    group: mutations_replication
+    priority: P1
+    applies_to: [standalone, replicated]
+    scope: node
+    tables: [system.mutations]
+    since: "20.4"
+    interval: 15m
+    query: |
+      SELECT
+        max(cnt)      AS max_active_muts_per_table,
+        toUInt64(sum(cnt)) AS total_active_muts
+      FROM
+      (
+        SELECT database, `table`, count() AS cnt
+        FROM system.mutations
+        WHERE is_done = 0
+        GROUP BY database, `table`
+      )
+    thresholds:
+      - { metric: max_active_muts_per_table, op: gte, value: 10, severity: warning }
+      - { metric: max_active_muts_per_table, op: gte, value: 40, severity: critical }
+    threshold_version: 1
+    thresholds_updated_at: "2026-10-28T00:00:00Z"
+    thresholds_source: builtin
+    unit_map: { max_active_muts_per_table: count }
+    owner: "clickwatch"
+    labels: [P1, mutations, daily]
+    notes: >-
+      Чек-лист п.6. Приближение к max_part_mutations (default 50) тормозит вставки.
+
+  # --------------------------------------------------------------------------
+  # Блок B. Части и диск (чек-лист 7-11)
+  # --------------------------------------------------------------------------
+
+  - id: 7
+    uid: "ch.parts.too_many_parts"
+    title_en: "Too Many Parts"
+    title_ru: "Too many parts и backpressure вставок"
+    group: parts_disk
+    priority: P2
+    applies_to: [standalone, replicated]
+    scope: node
+    tables: [system.parts, system.asynchronous_metrics]
+    since: "22.3"
+    interval: 5m
+    query: |
+      SELECT
+        coalesce(max(cnt), 0)   AS max_parts_per_partition,
+        coalesce(max(tcnt), 0)  AS max_parts_per_table,
+        toUInt64(sum(tcnt))     AS total_parts,
+        toUInt64((SELECT maxIf(value, metric = 'MaxPartCountForPartition')
+                  FROM system.asynchronous_metrics)) AS too_many_parts_count,
+        toUInt64((SELECT maxIf(value, metric = 'PartsToDelayInsert')
+                  FROM system.asynchronous_metrics)) AS parts_to_delay_inserts,
+        toUInt64((SELECT maxIf(value, metric = 'PartsToThrowInsert')
+                  FROM system.asynchronous_metrics)) AS parts_to_throw_inserts
+      FROM
+      (
+        SELECT database, `table`,
+               count() AS tcnt,
+               max(pc) AS cnt
+        FROM
+        (
+          SELECT database, `table`, partition, count() AS pc
+          FROM system.parts
+          WHERE active
+          GROUP BY database, `table`, partition
+        )
+        GROUP BY database, `table`
+      )
+    thresholds:
+      - { metric: max_parts_per_partition, op: gte, value: 100, severity: warning }
+      - { metric: max_parts_per_partition, op: gte, value: 200, severity: critical }
+      - { metric: too_many_parts_count,    op: gte, value: 200, severity: warning }
+      - { metric: too_many_parts_count,    op: gte, value: 500, severity: critical }
+      - { metric: parts_to_delay_inserts,  op: gte, value: 1,   severity: warning }
+      - { metric: parts_to_throw_inserts,  op: gte, value: 1,   severity: critical }
+    threshold_version: 2
+    thresholds_updated_at: "2026-10-28T00:00:00Z"
+    thresholds_source: builtin
+    unit_map: { max_parts_per_partition: count, max_parts_per_table: count, total_parts: count,
+                too_many_parts_count: count, parts_to_delay_inserts: count, parts_to_throw_inserts: count }
+    owner: "clickwatch"
+    labels: [P2, parts, daily]
+    notes: >-
+      Чек-лист п.7. Прямой тормоз/блокировка INSERT; точный предел зависит от настроек мерджей.
+      Добавлены асинхронные метрики backpressure (PartsToDelayInsert/PartsToThrowInsert, 22.x+,
+      реестр №64-66) и суммарные парты. С 23.6 дефолт too_many_parts = 1000, поэтому порог
+      200 частей в партиции - раннее предупреждение. since 22.3: на 21.x правило
+      skipped_unsupported (метрики delay/throw отсутствуют).
+
+  - id: 8
+    uid: "ch.parts.inactive_garbage"
+    title_en: "Inactive Parts / GC Lag"
+    title_ru: "Неактивные части (мусор)"
+    group: parts_disk
+    priority: P2
+    applies_to: [standalone, replicated]
+    scope: node
+    tables: [system.parts]
+    interval: 15m
+    query: |
+      SELECT
+        round(coalesce(max(ratio), 0), 3)                 AS max_stale_ratio,
+        toUInt64(coalesce(sum(stale_bytes), 0))           AS stale_bytes_total,
+        round(coalesce(max(stale_age_sec), 0) / 3600, 1)  AS oldest_inactive_hours,
+        toUInt64(coalesce(sum(inactive_cnt), 0))          AS inactive_parts
+      FROM
+      (
+        SELECT
+          database, `table`,
+          countIf(NOT active)                                    AS inactive_cnt,
+          if(sumIf(bytes_on_disk, active) > 0,
+             sumIf(bytes_on_disk, NOT active) / sumIf(bytes_on_disk, active), 0) AS ratio,
+          sumIf(bytes_on_disk, NOT active)                       AS stale_bytes,
+          maxIf(now() - modification_time, NOT active)           AS stale_age_sec
+        FROM system.parts
+        GROUP BY database, `table`
+        HAVING stale_bytes > 0
+      )
+    thresholds:
+      - { metric: max_stale_ratio,     op: gte, value: 0.10,  severity: warning }
+      - { metric: max_stale_ratio,     op: gte, value: 0.25,  severity: critical }
+      - { metric: stale_bytes_total,   op: gte, value: 100000000000, severity: warning }
+      - { metric: oldest_inactive_hours, op: gte, value: 24, severity: warning }
+    threshold_version: 2
+    thresholds_updated_at: "2026-10-28T00:00:00Z"
+    thresholds_source: builtin
+    unit_map: { max_stale_ratio: ratio, stale_bytes_total: bytes, oldest_inactive_hours: hours, inactive_parts: count }
+    owner: "clickwatch"
+    labels: [P2, parts, disk, daily]
+    notes: >-
+      Чек-лист п.8. Неактивные части существуют до завершения всех мутаций/мерджей и
+      долгих SELECT; их рост - следствие зависших мутаций или долгих чтений.
+
+  - id: 9
+    uid: "ch.disks.free_space"
+    title_en: "Disk Free Space"
+    title_ru: "Свободное место на дисках"
+    group: parts_disk
+    priority: P1
+    applies_to: [standalone, replicated]
+    scope: node
+    tables: [system.disks]
+    since: "22.5"
+    interval: 2m
+    query: |
+      SELECT
+        round(sum(used_space) * 100.0 / nullIf(sum(total_space), 0), 1)  AS disk_used_pct,
+        toUInt64(sum(used_space))                                        AS disk_used,
+        toUInt64(sum(total_space))                                       AS disk_total,
+        round(min(free_space * 100.0 / total_space), 1)                  AS min_free_percent,
+        toUInt64(min(free_space))                                        AS min_free_bytes,
+        toUInt64(sumIf(used_space, type = 's3'))                         AS s3_disk_used,
+        toUInt64(sumIf(free_space, type = 's3'))                         AS s3_disk_free,
+        toUInt64(sumIf(total_space, type = 's3'))                        AS s3_disk_total,
+        round(sumIf(used_space, type = 's3') * 100.0
+              / nullIf(sumIf(total_space, type = 's3'), 0), 1)           AS s3_used_pct,
+        toUInt64(max(keep_free_space))                                   AS keep_free_space
+      FROM system.disks
+      WHERE total_space > 0
+    thresholds:
+      - { metric: min_free_percent, op: lt, value: 25, severity: warning }
+      - { metric: min_free_percent, op: lt, value: 10, severity: critical }
+    threshold_version: 2
+    thresholds_updated_at: "2026-10-28T00:00:00Z"
+    thresholds_source: builtin
+    unit_map: { disk_used_pct: percent, disk_used: bytes, disk_total: bytes, min_free_percent: percent,
+                min_free_bytes: bytes, s3_disk_used: bytes, s3_disk_free: bytes, s3_disk_total: bytes,
+                s3_used_pct: percent, keep_free_space: bytes }
+    owner: "clickwatch"
+    labels: [P1, disk, daily]
+    notes: >-
+      Чек-лист п.9. Мутации удваивают объём на время переписывания; в 25.2+ вставки
+      учитывают брони (min_free_disk_bytes_to_perform_insert).
+      Добавлены S3-колонки (реестр №49-52); нет S3 дисков - NULL, это норма.
+      since 22.5: колонка type/диски S3 появились в 22.x.
+
+  - id: 10
+    uid: "ch.disks.io_saturation"
+    title_en: "Disk I/O Saturation"
+    title_ru: "Насыщение диска по I/O"
+    group: parts_disk
+    priority: P2
+    applies_to: [standalone, replicated]
+    scope: node
+    tables: [system.metric_log]
+    interval: 15m
+    query: |
+      SELECT
+        round((max(ProfileEvent.OSDiskReadBytes) - min(ProfileEvent.OSDiskReadBytes))
+              / 900 / 1048576, 1) AS read_mbps,
+        round((max(ProfileEvent.OSDiskWriteBytes) - min(ProfileEvent.OSDiskWriteBytes))
+              / 900 / 1048576, 1)  AS write_mbps,
+        round((max(ProfileEvent.ReadBufferFromFileDescriptorRead)
+             - min(ProfileEvent.ReadBufferFromFileDescriptorRead)) / 900, 1)   AS disk_iops_read,
+        round((max(ProfileEvent.WriteBufferFromFileDescriptorWrite)
+             - min(ProfileEvent.WriteBufferFromFileDescriptorWrite)) / 900, 1) AS disk_iops_write
+      FROM system.metric_log
+      WHERE event_date >= today() - 1
+        AND event_time >= now() - INTERVAL 15 MINUTE
+        AND (ProfileEvent.OSDiskReadBytes > 0 OR ProfileEvent.OSDiskWriteBytes > 0)
+    thresholds:
+      - { metric: read_mbps,  op: gte, value: 400, severity: warning }
+      - { metric: read_mbps,  op: gte, value: 800, severity: critical }
+      - { metric: write_mbps, op: gte, value: 400, severity: warning }
+      - { metric: write_mbps, op: gte, value: 800, severity: critical }
+    threshold_version: 2
+    thresholds_updated_at: "2026-10-28T00:00:00Z"
+    thresholds_source: builtin
+    unit_map: { read_mbps: mbps, write_mbps: mbps, disk_iops_read: count, disk_iops_write: count }
+    owner: "clickwatch"
+    labels: [P2, disk, io, daily]
+    notes: >-
+      Чек-лист п.10. Пороги дефолтные под NVMe ~ 1 ГБ/с; dba должен привести к профилю своих дисков.
+      Требуется включённый metric_log; агрегат по окну 15 мин с шагом metric_log (обычно 60с).
+      IOPS считаются из ProfileEvents ReadBufferFromFileDescriptorRead/Write (реестр №55-56);
+      counter-дубль остаётся в снимке ch.gauges.core_counters.
+
+  - id: 11
+    uid: "ch.parts.churn"
+    title_en: "High Part Churn"
+    title_ru: "Скорость появления новых частей"
+    group: parts_disk
+    priority: P2
+    applies_to: [standalone, replicated]
+    scope: node
+    tables: [system.part_log, system.parts]
+    interval: 15m
+    query: |
+      SELECT
+        round((SELECT countIf(event_type = 'NewPart' AND event_time >= now() - INTERVAL 1 HOUR)
+               FROM system.part_log) / 60.0, 2)                                      AS new_parts_per_min,
+        toUInt64(coalesce((SELECT avgIf(bytes_on_disk, active AND level = 0)
+               FROM system.parts), 0))                                                AS avg_new_part_bytes,
+        toUInt64((SELECT round(avg(bytes_on_disk)) FROM system.parts WHERE active))   AS avg_part_size
+    thresholds:
+      - { metric: new_parts_per_min, op: gte, value: 5,  severity: warning }
+      - { metric: new_parts_per_min, op: gte, value: 20, severity: critical }
+    threshold_version: 2
+    thresholds_updated_at: "2026-10-28T00:00:00Z"
+    thresholds_source: builtin
+    unit_map: { new_parts_per_min: count, avg_new_part_bytes: bytes, avg_part_size: bytes }
+    owner: "clickwatch"
+    labels: [P2, parts, insert, daily]
+    notes: >-
+      Чек-лист п.11. Дробный поток маленьких частей давит фоновый пул и мешает мутациям.
+
+  # --------------------------------------------------------------------------
+  # Блок C. Запросы и нагрузка (чек-лист 12-17)
+  # --------------------------------------------------------------------------
+
+  - id: 12
+    uid: "ch.queries.long_selects"
+    title_en: "Long-Running Queries"
+    title_ru: "Длинные выполняющиеся запросы"
+    group: queries_load
+    priority: P2
+    applies_to: [standalone, replicated]
+    scope: node
+    tables: [system.processes, system.query_log, system.metrics]
+    interval: 5m
+    query: |
+      SELECT
+        toUInt64(countIf(elapsed > 900)) AS long_selects,
+        toUInt64(count())                AS running_queries,
+        toUInt64((SELECT max(value) FROM system.metrics WHERE metric = 'Query')
+               + (SELECT max(value) FROM system.metrics WHERE metric = 'InsertQuery'))
+                                                                          AS query_concurrency,
+        toUInt64((SELECT quantile(0.95)(query_duration_ms) FROM system.query_log
+                  WHERE type = 'QueryFinish' AND event_date >= today() - 1
+                    AND event_time >= now() - INTERVAL 1 HOUR))           AS query_p95_ms,
+        toUInt64((SELECT quantile(0.95)(query_duration_ms) FROM system.query_log
+                  WHERE type = 'QueryFinish' AND query ILIKE 'SELECT%'
+                    AND event_date >= today() - 1
+                    AND event_time >= now() - INTERVAL 1 HOUR))           AS select_p95_ms
+      FROM system.processes
+    thresholds:
+      - { metric: long_selects,   op: gte, value: 5,   severity: warning }
+      - { metric: long_selects,   op: gte, value: 20,  severity: critical }
+      - { metric: running_queries, op: gte, value: 200, severity: warning }
+    threshold_version: 2
+    thresholds_updated_at: "2026-10-28T00:00:00Z"
+    thresholds_source: builtin
+    unit_map: { long_selects: count, running_queries: count, query_concurrency: count,
+                query_p95_ms: ms, select_p95_ms: ms }
+    owner: "clickwatch"
+    labels: [P2, queries, daily]
+    notes: >-
+      Чек-лист п.12. Длинные чтения удерживают старые части и мешают GC после мутаций.
+      Добавлены p95 запросов/SELECT за окно 1ч (реестр №3, №7) и конкурентность (№12).
+      Фильтр SELECT по тексту запроса - эвристика; окно пусто при log_queries=0.
+
+  - id: 13
+    uid: "ch.queries.exceptions"
+    title_en: "Query Exceptions"
+    title_ru: "Ошибки запросов"
+    group: queries_load
+    priority: P2
+    applies_to: [standalone, replicated]
+    scope: node
+    tables: [system.query_log, system.events]
+    interval: 15m
+    query: |
+      SELECT
+        toUInt64(countIf(type = 'ExceptionWhileProcessing')) AS exceptions_hour,
+        toUInt64((SELECT sumIf(value, event IN ('FailedQuery', 'FailedSelectQuery', 'FailedInsertQuery'))
+                  FROM system.events)) AS query_errors_count
+      FROM system.query_log
+      WHERE event_date >= today() - 1
+        AND event_time >= now() - INTERVAL 1 HOUR
+    thresholds:
+      - { metric: exceptions_hour, op: gte, value: 10, severity: warning }
+      - { metric: exceptions_hour, op: gte, value: 50, severity: critical }
+    threshold_version: 2
+    thresholds_updated_at: "2026-10-28T00:00:00Z"
+    thresholds_source: builtin
+    unit_map: { exceptions_hour: count, query_errors_count: count }
+    owner: "clickwatch"
+    labels: [P2, queries, errors, daily]
+    notes: >-
+      Чек-лист п.13. Требуется включённый query_log. Стабильно высокие ошибки - проблема ETL/cron.
+      query_errors_count - кумулятивный счётчик system.events (реестр №5); rate/delta считает
+      SaaS по точкам агента.
+
+  - id: 14
+    uid: "ch.queries.cancelled"
+    title_en: "Cancelled Queries"
+    title_ru: "Отменённые запросы"
+    group: queries_load
+    priority: P3
+    applies_to: [standalone, replicated]
+    scope: node
+    tables: [system.query_log, system.events]
+    interval: 15m
+    query: |
+      SELECT
+        toUInt64(countIf(exception_code = 394)) AS cancelled_hour,
+        toUInt64((SELECT maxIf(value, event = 'CancelledQuery') FROM system.events))
+                                                     AS cancelled_queries
+      FROM system.query_log
+      WHERE event_date >= today() - 1
+        AND event_time >= now() - INTERVAL 1 HOUR
+    thresholds:
+      - { metric: cancelled_hour, op: gte, value: 50, severity: warning }
+    threshold_version: 2
+    thresholds_updated_at: "2026-10-28T00:00:00Z"
+    thresholds_source: builtin
+    unit_map: { cancelled_hour: count, cancelled_queries: count }
+    owner: "clickwatch"
+    labels: [P3, queries, weekly]
+    notes: >-
+      Чек-лист п.14. Рост отмен - признак перегрузки или kill-спама снаружи.
+      cancelled_queries - кумулятивный счётчик из system.events (реестр №6).
+
+  - id: 15
+    uid: "ch.queries.insert_latency"
+    title_en: "Slow Insert Latency"
+    title_ru: "Задержка вставок"
+    group: queries_load
+    priority: P2
+    applies_to: [standalone, replicated]
+    scope: node
+    tables: [system.part_log, system.query_log]
+    interval: 15m
+    query: |
+      SELECT
+        toUInt64(quantile(0.99)(duration_ms)) AS p99_insert_ms,
+        toUInt64(count())                     AS inserts_hour,
+        toUInt64((SELECT quantile(0.95)(query_duration_ms) FROM system.query_log
+                  WHERE type = 'QueryFinish' AND query ILIKE 'INSERT%'
+                    AND event_date >= today() - 1
+                    AND event_time >= now() - INTERVAL 1 HOUR)) AS insert_p95_ms
+      FROM system.part_log
+      WHERE event_type = 'NewPart'
+        AND event_date >= today() - 1
+        AND event_time >= now() - INTERVAL 1 HOUR
+    thresholds:
+      - { metric: p99_insert_ms, op: gte, value: 1000, severity: warning }
+      - { metric: p99_insert_ms, op: gte, value: 5000, severity: critical }
+    threshold_version: 2
+    thresholds_updated_at: "2026-10-28T00:00:00Z"
+    thresholds_source: builtin
+    unit_map: { p99_insert_ms: ms, inserts_hour: count, insert_p95_ms: ms }
+    owner: "clickwatch"
+    labels: [P2, insert, daily]
+    notes: >-
+      Чек-лист п.15. Медленные вставки порождают много мелких частей; в 25.x не путать
+      отказ вставки по свободному месту (min_free_disk_ratio_to_perform_insert) с перегрузкой.
+      insert_p95_ms - из query_log (реестр №8); вставка по тексту запроса - эвристика.
+
+  - id: 16
+    uid: "ch.queries.user_imbalance"
+    title_en: "User Workload Imbalance"
+    title_ru: "Дисбаланс пользователей"
+    group: queries_load
+    priority: P3
+    applies_to: [standalone, replicated]
+    scope: node
+    tables: [system.query_log]
+    interval: 1h
+    query: |
+      WITH q AS
+      (
+        SELECT user, count() AS cnt
+        FROM system.query_log
+        WHERE type = 'QueryFinish'
+          AND event_date >= today() - 1
+          AND event_time >= now() - INTERVAL 1 HOUR
+        GROUP BY user
+      )
+      SELECT
+        (SELECT user FROM q ORDER BY cnt DESC LIMIT 1) AS top_user,
+        if((SELECT sum(cnt) FROM q) > 0,
+           round((SELECT max(cnt) FROM q) * 100.0 / (SELECT sum(cnt) FROM q), 1), 0) AS top_user_share_pct,
+        toUInt64((SELECT sum(cnt) FROM q)) AS total_queries_hour
+    thresholds:
+      - { metric: top_user_share_pct, op: gte, value: 50, severity: warning }
+    threshold_version: 1
+    thresholds_updated_at: "2026-10-28T00:00:00Z"
+    thresholds_source: builtin
+    unit_map: { top_user_share_pct: percent, total_queries_hour: count }
+    owner: "clickwatch"
+    labels: [P3, queries, users, weekly]
+    notes: >-
+      Чек-лист п.16. Один пользователь, потребляющий более половины нагрузки за час.
+
+  - id: 17
+    uid: "ch.queries.throughput_baseline"
+    title_en: "Throughput Baseline Drift"
+    title_ru: "Скользящий профиль нагрузки (базовая линия)"
+    group: queries_load
+    priority: P3
+    applies_to: [standalone, replicated]
+    scope: saas
+    tables: [system.query_log, system.events]
+    interval: 15m
+    query: |
+      SELECT
+        round(count() / 3600.0, 2)               AS qps_last_hour,
+        toUInt64(count())                        AS queries_last_hour,
+        toUInt64(sumIf(read_rows, type = 'QueryFinish')) AS read_rows_hour,
+        toUInt64((SELECT quantile(0.5)(query_duration_ms) FROM system.query_log
+                  WHERE type = 'QueryFinish' AND event_date >= today() - 1
+                    AND event_time >= now() - INTERVAL 1 HOUR))  AS query_p50_ms,
+        toUInt64((SELECT quantile(0.99)(query_duration_ms) FROM system.query_log
+                  WHERE type = 'QueryFinish' AND event_date >= today() - 1
+                    AND event_time >= now() - INTERVAL 1 HOUR))  AS query_p99_ms,
+        toUInt64((SELECT maxIf(value, event = 'Query')        FROM system.events)) AS counter_query,
+        toUInt64((SELECT maxIf(value, event = 'SelectedRows') FROM system.events)) AS counter_selected_rows,
+        toUInt64((SELECT maxIf(value, event = 'InsertedRows') FROM system.events)) AS counter_inserted_rows,
+        hostname() AS hostname
+      FROM system.query_log
+      WHERE event_date >= today() - 1
+        AND event_time >= now() - INTERVAL 1 HOUR
+    thresholds: []
+    threshold_version: 2
+    thresholds_updated_at: "2026-10-28T00:00:00Z"
+    thresholds_source: builtin
+    unit_map: { qps_last_hour: count, read_rows_hour: count, query_p50_ms: ms, query_p99_ms: ms,
+                counter_query: count, counter_selected_rows: count, counter_inserted_rows: count }
+    owner: "clickwatch"
+    labels: [P3, queries, weekly]
+    notes: >-
+      Чек-лист п.17. Сравнение с медианой прошлых недель делает SaaS (scope: saas).
+      Добавлены p50/p99 (реестр №2, №4) и кумулятивные счётчики Query/SelectedRows/InsertedRows
+      (rate/дельты SaaS считает по точкам).
+
+  # --------------------------------------------------------------------------
+  # Блок D. Память и процессы (чек-лист 18-21)
+  # --------------------------------------------------------------------------
+
+  - id: 18
+    uid: "ch.memory.query_limits"
+    title_en: "Query Memory Limits / OOM"
+    title_ru: "Лимиты памяти запросов / OOM"
+    group: memory_processes
+    priority: P2
+    applies_to: [standalone, replicated]
+    scope: node
+    tables: [system.errors, system.query_log, system.metrics, system.events]
+    interval: 15m
+    query: |
+      SELECT
+        toUInt64((SELECT countIf(code = 241 AND last_error_time >= now() - INTERVAL 24 HOUR)
+                  FROM system.errors)) AS oom_24h,
+        toInt64((SELECT round(quantile(0.99)(memory_usage))
+                 FROM system.query_log
+                 WHERE type = 'QueryFinish' AND event_date >= today() - 1
+                   AND event_time >= now() - INTERVAL 24 HOUR AND memory_usage > 0)) AS p99_query_memory,
+        toInt64((SELECT round(avg(memory_usage))
+                 FROM system.query_log
+                 WHERE type = 'QueryFinish' AND event_date >= today() - 1
+                   AND event_time >= now() - INTERVAL 24 HOUR AND memory_usage > 0)) AS avg_memory_per_query,
+        toInt64((SELECT round(max(memory_usage))
+                 FROM system.query_log
+                 WHERE type = 'QueryFinish' AND event_date >= today() - 1
+                   AND event_time >= now() - INTERVAL 24 HOUR AND memory_usage > 0)) AS max_memory_per_query,
+        toInt64((SELECT maxIf(value, metric = 'MemoryTracking') FROM system.metrics)) AS ch_memory_usage,
+        toUInt64((SELECT maxIf(value, event = 'OutOfMemory') FROM system.events)) AS oom_count
+    thresholds:
+      - { metric: oom_24h, op: gte, value: 5,  severity: warning }
+      - { metric: oom_24h, op: gte, value: 20, severity: critical }
+    threshold_version: 2
+    thresholds_updated_at: "2026-10-28T00:00:00Z"
+    thresholds_source: builtin
+    unit_map: { oom_24h: count, p99_query_memory: bytes, avg_memory_per_query: bytes,
+                max_memory_per_query: bytes, ch_memory_usage: bytes, oom_count: count }
+    owner: "clickwatch"
+    labels: [P2, memory, daily]
+    notes: >-
+      Чек-лист п.18. Код 241 = Memory limit exceeded; p99 оценивается относительно max_memory_usage
+      сервера (сравнение на стороне SaaS).
+      Добавлены avg/max память на запрос (реестр №10-11), расход CH (№22) и счётчик
+      events.OutOfMemory (№105; rate - SaaS).
+
+  - id: 19
+    uid: "ch.memory.crashes"
+    title_en: "Server Crashes"
+    title_ru: "Падения сервера (segfault)"
+    group: memory_processes
+    priority: P2
+    applies_to: [standalone, replicated]
+    scope: node
+    tables: [system.crash_log, system.asynchronous_metrics]
+    since: "21.8"
+    interval: 15m
+    query: |
+      SELECT
+        toUInt64(countIf(crash_time >= now() - INTERVAL 24 HOUR))          AS crashes_24h,
+        toUInt64((SELECT maxIf(value, metric = 'Uptime') FROM system.asynchronous_metrics))
+                                                                            AS uptime_seconds
+      FROM system.crash_log
+    thresholds:
+      - { metric: crashes_24h, op: gte, value: 1, severity: critical }
+    threshold_version: 2
+    thresholds_updated_at: "2026-10-28T00:00:00Z"
+    thresholds_source: builtin
+    unit_map: { crashes_24h: count, uptime_seconds: seconds }
+    owner: "clickwatch"
+    labels: [P2, stability, daily]
+    notes: >-
+      Чек-лист п.19. Любая запись crash_log - немедленный разбор (стек сохранён в таблице).
+      uptime_seconds (реестр №42, №103): внезапный сброс uptime - рестарт даже без crash_log.
+
+  - id: 20
+    uid: "ch.memory.jemalloc_fragmentation"
+    title_en: "Jemalloc Fragmentation"
+    title_ru: "Фрагментация памяти (jemalloc)"
+    group: memory_processes
+    priority: P3
+    applies_to: [standalone, replicated]
+    scope: node
+    tables: [system.asynchronous_metrics]
+    interval: 1h
+    query: |
+      SELECT
+        round(maxIf(value, metric = 'JemallocMappedBytes'))   AS jemalloc_mapped,
+        round(maxIf(value, metric = 'JemallocResidentBytes')) AS jemalloc_resident,
+        round(maxIf(value, metric = 'JemallocActiveBytes'))   AS jemalloc_active,
+        round((maxIf(value, metric = 'JemallocMappedBytes') - maxIf(value, metric = 'JemallocActiveBytes'))
+              * 100.0 / nullIf(maxIf(value, metric = 'JemallocMappedBytes'), 0), 1) AS memory_fragmentation
+      FROM system.asynchronous_metrics
+      WHERE metric IN ('JemallocMappedBytes', 'JemallocResidentBytes', 'JemallocActiveBytes')
+    thresholds:
+      - { metric: memory_fragmentation, op: gte, value: 20, severity: warning }
+      - { metric: memory_fragmentation, op: gte, value: 30, severity: critical }
+    threshold_version: 2
+    thresholds_updated_at: "2026-10-28T00:00:00Z"
+    thresholds_source: builtin
+    unit_map: { jemalloc_mapped: bytes, jemalloc_resident: bytes, jemalloc_active: bytes,
+                memory_fragmentation: percent }
+    owner: "clickwatch"
+    labels: [P3, memory, weekly]
+    notes: >-
+      Чек-лист п.20. memory_fragmentation по формуле ClickWatch (mapped - active)/mapped
+      (реестр №33, §12.1 реестр метрик ClickWatch); resident-колонка сохранена для сравнения.
+
+  - id: 21
+    uid: "ch.memory.thread_leak"
+    title_en: "Thread Pool Leak"
+    title_ru: "Потоки: аллокация против активных"
+    group: memory_processes
+    priority: P3
+    applies_to: [standalone, replicated]
+    scope: node
+    tables: [system.metrics, system.asynchronous_metrics]
+    interval: 1h
+    query: |
+      SELECT
+        toUInt64(maxIf(value, metric = 'GlobalThread'))       AS threads_total,
+        toUInt64(maxIf(value, metric = 'GlobalThreadActive')) AS threads_active,
+        toUInt64(maxIf(value, metric = 'GlobalThread') - maxIf(value, metric = 'GlobalThreadActive')) AS threads_idle,
+        toUInt64((SELECT maxIf(value, metric = 'ThreadingThreads') FROM system.asynchronous_metrics))
+                                                                            AS threads_count
+      FROM system.metrics
+      WHERE metric IN ('GlobalThread', 'GlobalThreadActive')
+    thresholds:
+      - { metric: threads_idle,  op: gte, value: 50,   severity: warning }
+      - { metric: threads_total, op: gte, value: 1000, severity: critical }
+    threshold_version: 2
+    thresholds_updated_at: "2026-10-28T00:00:00Z"
+    thresholds_source: builtin
+    unit_map: { threads_total: count, threads_active: count, threads_idle: count, threads_count: count }
+    owner: "clickwatch"
+    labels: [P3, memory, threads, weekly]
+    notes: >-
+      Чек-лист п.21. Устойчивая разница allocated/active - признак утечки или зависших задач.
+      threads_count - из async.ThreadingThreads (реестр №44).
+
+  # --------------------------------------------------------------------------
+  # Блок E. Состояние СУБД и репликации (чек-лист 22-30)
+  # --------------------------------------------------------------------------
+
+  - id: 22
+    uid: "ch.state.keeper_sessions"
+    title_en: "Keeper Session Health"
+    title_ru: "Сессии ZooKeeper/Keeper"
+    group: dbms_state
+    priority: P1
+    applies_to: [replicated]
+    scope: node
+    tables: [system.replicas, system.metrics, system.asynchronous_metrics]
+    since: "23.5"
+    interval: 15m
+    query: |
+      SELECT
+        toUInt64((SELECT countIf(is_session_expired) FROM system.replicas)) AS sessions_expired,
+        toUInt64((SELECT countIf(total_replicas != active_replicas) FROM system.replicas)) AS tables_with_inactive_replicas,
+        toUInt64((SELECT maxIf(value, metric = 'ZooKeeperSessions') FROM system.metrics)) AS zk_sessions,
+        toUInt64((SELECT maxIf(value, metric = 'ZooKeeperOutstandingRequests') FROM system.asynchronous_metrics)) AS zk_outstanding_requests,
+        round((SELECT maxIf(value, metric = 'ZooKeeperRequestLatency') FROM system.asynchronous_metrics), 1) AS zk_latency_ms,
+        toUInt64((SELECT maxIf(value, metric = 'ZooKeeperWatchCount') FROM system.asynchronous_metrics)) AS zk_watch_count
+    thresholds:
+      - { metric: sessions_expired, op: gte, value: 1, severity: critical }
+    threshold_version: 2
+    thresholds_updated_at: "2026-10-28T00:00:00Z"
+    thresholds_source: builtin
+    unit_map: { sessions_expired: count, zk_sessions: count, zk_outstanding_requests: count,
+                zk_latency_ms: ms, zk_watch_count: count }
+    owner: "clickwatch"
+    labels: [P1, replication, keeper, daily]
+    notes: >-
+      Чек-лист п.22. is_session_expired появился в ~23.5; на более старых версиях правило
+      пропустится as skipped_unsupported (since: 23.5).
+      Добавлены gauge Keeper (реестр №79-82): сессии, outstanding, latency, watches.
+      Статус соединения Keeper (№88, только 25.x+) вынесен в правило id 46 - см. §12.6.
+
+  - id: 23
+    uid: "ch.state.readonly_replicas"
+    title_en: "Read-only Replicas"
+    title_ru: "Реплики/таблицы в read-only"
+    group: dbms_state
+    priority: P1
+    applies_to: [replicated]
+    scope: node
+    tables: [system.replicas]
+    interval: 2m
+    query: |
+      SELECT
+        toUInt64(countIf(is_readonly)) AS replicas_readonly,
+        countIf(total_replicas != active_replicas) AS tables_without_full_quorum,
+        toUInt64(countIf(NOT is_readonly AND lost_part_count = 0)) AS replicas_healthy,
+        toUInt64(count()) AS replicas_count,
+        toUInt64(max(absolute_delay))        AS replication_lag_max,
+        toUInt64(round(avg(absolute_delay))) AS replication_lag_avg
+      FROM system.replicas
+    thresholds:
+      - { metric: replicas_readonly,   op: gte, value: 1,    severity: warning }
+      - { metric: replicas_readonly,   op: gte, value: 5,    severity: critical }
+      - { metric: replication_lag_max, op: gte, value: 300,  severity: warning }
+      - { metric: replication_lag_max, op: gte, value: 1800, severity: critical }
+    threshold_version: 2
+    thresholds_updated_at: "2026-10-28T00:00:00Z"
+    thresholds_source: builtin
+    unit_map: { replicas_readonly: count, tables_without_full_quorum: count, replicas_healthy: count,
+                replicas_count: count, replication_lag_max: seconds, replication_lag_avg: seconds }
+    owner: "clickwatch"
+    labels: [P1, replication, daily]
+    notes: >-
+      Чек-лист п.23. Устойчивость read-only > 5 мин подтверждает SaaS (переходы по времени).
+      Добавлен replication lag (absolute_delay, реестр №73-74 - крупнейший пробел старого
+      чек-листа; пороги 300/1800 с). replicas_healthy - упрощённый аналог №76 без
+      is_session_expired (23.5+); session-часть контролирует правило id 22.
+      Переименование readonly_tables -> replicas_readonly (совместимость с ClickWatch).
+
+  - id: 24
+    uid: "ch.state.lost_parts"
+    title_en: "Lost Parts"
+    title_ru: "Потерянные части"
+    group: dbms_state
+    priority: P1
+    applies_to: [replicated]
+    scope: node
+    tables: [system.replicas]
+    interval: 15m
+    query: |
+      SELECT
+        toUInt64(countIf(lost_part_count > 0)) AS tables_with_lost_parts,
+        toUInt64(max(lost_part_count))          AS max_lost_parts
+      FROM system.replicas
+    thresholds:
+      - { metric: tables_with_lost_parts, op: gte, value: 1, severity: critical }
+    threshold_version: 1
+    thresholds_updated_at: "2026-10-28T00:00:00Z"
+    thresholds_source: builtin
+    unit_map: { max_lost_parts: count }
+    owner: "clickwatch"
+    labels: [P1, data_loss, daily]
+    notes: >-
+      Чек-лист п.24. Инцидент потери данных - немедленный разбор (lost_part_count > 0).
+
+  - id: 25
+    uid: "ch.state.long_fetches"
+    title_en: "Long Fetches"
+    title_ru: "Долгие fetches частей"
+    group: dbms_state
+    priority: P2
+    applies_to: [replicated]
+    scope: node
+    tables: [system.replicated_fetches, system.metrics]
+    interval: 15m
+    query: |
+      SELECT
+        toUInt64(count())        AS fetches_active,
+        round(coalesce(max(elapsed), 0), 0) AS oldest_fetch_sec,
+        toUInt64((SELECT maxIf(value, metric = 'ReplicatedFetch') FROM system.metrics)) AS fetch_pending
+      FROM system.replicated_fetches
+    thresholds:
+      - { metric: oldest_fetch_sec, op: gte, value: 900,  severity: warning }
+      - { metric: oldest_fetch_sec, op: gte, value: 3600, severity: critical }
+      - { metric: fetches_active,   op: gte, value: 20,   severity: warning }
+    threshold_version: 2
+    thresholds_updated_at: "2026-10-28T00:00:00Z"
+    thresholds_source: builtin
+    unit_map: { oldest_fetch_sec: seconds, fetches_active: count, fetch_pending: count }
+    owner: "clickwatch"
+    labels: [P2, replication, daily]
+    notes: >-
+      Чек-лист п.25. Висящий GET_PART не тормозит очередь репликации незаметно.
+      fetch_pending - gauge из metrics.ReplicatedFetch (реестр №84).
+
+  - id: 26
+    uid: "ch.state.parts_to_check"
+    title_en: "Parts To Check"
+    title_ru: "Проверка частей (верификация)"
+    group: dbms_state
+    priority: P2
+    applies_to: [replicated]
+    scope: node
+    tables: [system.replicas]
+    interval: 15m
+    query: |
+      SELECT toUInt64(max(parts_to_check)) AS max_parts_to_check
+      FROM system.replicas
+    thresholds:
+      - { metric: max_parts_to_check, op: gte, value: 50,  severity: warning }
+      - { metric: max_parts_to_check, op: gte, value: 200, severity: critical }
+    threshold_version: 1
+    thresholds_updated_at: "2026-10-28T00:00:00Z"
+    thresholds_source: builtin
+    unit_map: { max_parts_to_check: count }
+    owner: "clickwatch"
+    labels: [P2, integrity, weekly]
+    notes: >-
+      Чек-лист п.26. Проверка частей поднимается после подозрений на порчу данных.
+
+  - id: 27
+    uid: "ch.state.version_drift"
+    title_en: "Version Drift"
+    title_ru: "Версионный дрейф нод"
+    group: dbms_state
+    priority: P1
+    applies_to: [standalone, replicated]
+    scope: saas
+    tables: []
+    interval: 1h
+    query: |
+      SELECT version() AS ch_version, hostname() AS hostname
+    thresholds: []
+    threshold_version: 1
+    thresholds_updated_at: "2026-10-28T00:00:00Z"
+    thresholds_source: builtin
+    unit_map: {}
+    owner: "clickwatch"
+    labels: [P1, upgrades, weekly]
+    notes: >-
+      Чек-лист п.27. SaaS сравнивает версии нод кластера; major mismatch - paging.
+
+  - id: 28
+    uid: "ch.state.settings_fingerprint"
+    title_en: "Settings Drift"
+    title_ru: "Дрейф настроек (отпечаток)"
+    group: dbms_state
+    priority: P3
+    applies_to: [standalone, replicated]
+    scope: saas
+    tables: [system.settings]
+    interval: 1h
+    query: |
+      SELECT
+        hex(SHA256(toString(arraySort(groupArray(s)))))                      AS settings_fingerprint,
+        toUInt64(count())                                                   AS settings_rows,
+        toInt64OrNull(maxIf(value, name = 'mutations_sync'))                 AS mutations_sync,
+        toInt64OrNull(maxIf(value, name = 'max_memory_usage'))               AS max_memory_usage_bytes,
+        toInt64OrNull(maxIf(value, name = 'max_execution_time'))             AS max_execution_time_s,
+        toInt64OrNull(maxIf(value, name = 'background_pool_size'))           AS background_pool_size,
+        toFloat64OrNull(maxIf(value,
+          name = 'background_merges_mutations_concurrency_ratio'))           AS background_merges_mutations_concurrency_ratio,
+        toInt64OrNull(maxIf(value, name = 'max_part_mutations'))             AS max_part_mutations,
+        toInt64OrNull(maxIf(value, name = 'max_replicated_merges_in_queue')) AS max_replicated_merges_in_queue,
+        toInt64OrNull(maxIf(value, name = 'lightweight_deletes_sync'))       AS lightweight_deletes_sync
+      FROM
+      (
+        SELECT name, value, concat(name, '=', toString(value)) AS s
+        FROM system.settings
+        WHERE name IN
+        (
+          'mutations_sync', 'max_memory_usage', 'max_execution_time',
+          'background_pool_size', 'background_merges_mutations_concurrency_ratio',
+          'max_part_mutations', 'max_replicated_merges_in_queue',
+          'lightweight_delete_mode', 'lightweight_deletes_sync'
+        )
+      )
+    thresholds: []
+    threshold_version: 1
+    thresholds_updated_at: "2026-10-28T00:00:00Z"
+    thresholds_source: builtin
+    unit_map: { settings_rows: count, mutations_sync: count, max_memory_usage_bytes: bytes,
+                max_execution_time_s: seconds, background_pool_size: count,
+                background_merges_mutations_concurrency_ratio: ratio, max_part_mutations: count,
+                max_replicated_merges_in_queue: count, lightweight_deletes_sync: count }
+    owner: "clickwatch"
+    labels: [P3, config, weekly]
+    notes: >-
+      Чек-лист п.28. Отпечаток критичных настроек; SaaS сравнивает между репликами
+      кластера (расхождение = дрейф конфигурации). Хеш раскрыт значениями: числовые
+      настройки дублируются отдельными метриками для временных рядов (динамика
+      лимитов: max_memory_usage - байты, max_execution_time - секунды, остальные -
+      счётчики/коэффициент). Текстовая lightweight_delete_mode входит только в хеш -
+      ряд из текста не строится. Отсутствующая на старой версии настройка даёт NULL:
+      пропуск серии, не ноль.
+
+  - id: 29
+    uid: "ch.state.ddl_queue_stuck"
+    title_en: "Distributed DDL Queue Stuck"
+    title_ru: "Застревание DDL-очереди"
+    group: dbms_state
+    priority: P1
+    applies_to: [standalone, replicated]
+    scope: node
+    tables: [system.distributed_ddl_queue]
+    since: "24.0"
+    interval: 15m
+    query: |
+      SELECT
+        toUInt64(count())                                AS ddl_pending,
+        round(coalesce(max(intDiv(now() - time, 60)), 0), 0) AS oldest_ddl_min
+      FROM system.distributed_ddl_queue
+    thresholds:
+      - { metric: oldest_ddl_min, op: gte, value: 10, severity: warning }
+      - { metric: oldest_ddl_min, op: gte, value: 60, severity: critical }
+    threshold_version: 1
+    thresholds_updated_at: "2026-10-28T00:00:00Z"
+    thresholds_source: builtin
+    unit_map: { oldest_ddl_min: minutes, ddl_pending: count }
+    owner: "clickwatch"
+    labels: [P1, ddl, daily]
+    notes: >-
+      Чек-лист п.29. Таблица появилась в 24.x; в 23.x правило пропустится (since: 24.0) -
+      там DDL-очередь наблюдают прямо в Keeper.
+
+  - id: 30
+    uid: "ch.state.server_log_errors"
+    title_en: "Server Log Errors"
+    title_ru: "Ошибки серверного лога"
+    group: dbms_state
+    priority: P2
+    applies_to: [standalone, replicated]
+    scope: node
+    tables: [system.text_log]
+    interval: 15m
+    query: |
+      SELECT
+        toUInt64(countIf(level = 'Fatal')) AS fatal_hour,
+        toUInt64(countIf(level = 'Error')) AS errors_hour
+      FROM system.text_log
+      WHERE event_date >= today() - 1
+        AND event_time >= now() - INTERVAL 1 HOUR
+    thresholds:
+      - { metric: fatal_hour,  op: gte, value: 1,  severity: critical }
+      - { metric: errors_hour, op: gte, value: 50, severity: warning }
+    threshold_version: 1
+    thresholds_updated_at: "2026-10-28T00:00:00Z"
+    thresholds_source: builtin
+    unit_map: { fatal_hour: count, errors_hour: count }
+    owner: "clickwatch"
+    labels: [P2, logs, daily]
+    notes: >-
+      Чек-лист п.30. Записи FATAL в text_log -paging-событие.
+
+  # --------------------------------------------------------------------------
+  # Блок F. Фоновые процессы (чек-лист 31-34)
+  # --------------------------------------------------------------------------
+
+  - id: 31
+    uid: "ch.background.merges_health"
+    title_en: "Merge Progress / Failures"
+    title_ru: "Мерджи: прогресс и сбои"
+    group: background
+    priority: P2
+    applies_to: [standalone, replicated]
+    scope: node
+    tables: [system.merges, system.part_log, system.asynchronous_metrics]
+    interval: 15m
+    query: |
+      SELECT
+        toUInt64(count())                   AS active_merges,
+        round(coalesce(max(elapsed), 0), 0) AS oldest_merge_sec,
+        toUInt64((SELECT countIf(error != '')
+                  FROM system.part_log
+                  WHERE event_type = 'MergeParts'
+                    AND event_date >= today() - 1
+                    AND event_time >= now() - INTERVAL 1 HOUR)) AS merge_failures_hour,
+        toInt64((SELECT maxIf(value, metric = 'MemoryTrackingInBackgroundMerges') FROM system.asynchronous_metrics)) AS merge_memory
+      FROM system.merges
+    thresholds:
+      - { metric: oldest_merge_sec,    op: gte, value: 3600, severity: warning }
+      - { metric: merge_failures_hour, op: gte, value: 10,   severity: warning }
+    threshold_version: 2
+    thresholds_updated_at: "2026-10-28T00:00:00Z"
+    thresholds_source: builtin
+    unit_map: { oldest_merge_sec: seconds, merge_failures_hour: count, active_merges: count,
+                merge_memory: bytes }
+    owner: "clickwatch"
+    labels: [P2, merges, daily]
+    notes: >-
+      Чек-лист п.31. Долгие/падающие мерджи мешают мутациям занимать пул.
+      Переименование running_merges -> active_merges (реестр №61, совместимость с ClickWatch);
+      merge_memory - async.MemoryTrackingInBackgroundMerges (реестр №23).
+
+  - id: 32
+    uid: "ch.background.slow_merges"
+    title_en: "Slow Merges / Write Amplification"
+    title_ru: "Скорость слияний"
+    group: background
+    priority: P2
+    applies_to: [standalone, replicated]
+    scope: node
+    tables: [system.part_log]
+    interval: 1h
+    query: |
+      SELECT
+        toUInt64(quantile(0.95)(duration_ms)) AS p95_merge_ms,
+        toUInt64(count())                     AS merges_24h
+      FROM system.part_log
+      WHERE event_type = 'MergeParts'
+        AND event_date >= today() - 1
+        AND event_time >= now() - INTERVAL 24 HOUR
+    thresholds:
+      - { metric: p95_merge_ms, op: gte, value: 600000, severity: warning }
+    threshold_version: 1
+    thresholds_updated_at: "2026-10-28T00:00:00Z"
+    thresholds_source: builtin
+    unit_map: { p95_merge_ms: ms, merges_24h: count }
+    owner: "clickwatch"
+    labels: [P2, merges, daily]
+    notes: >-
+      Чек-лист п.32. Decile P95 по длительности мерджей за сутки.
+
+  - id: 33
+    uid: "ch.background.pool_utilization"
+    title_en: "Background Pool Utilization"
+    title_ru: "Утилизация фонового пула"
+    group: background
+    priority: P1
+    applies_to: [standalone, replicated]
+    scope: node
+    tables: [system.metrics, system.settings]
+    since: "22.6"
+    interval: 15m
+    query: |
+      WITH (SELECT max(toUInt64(value)) FROM system.settings WHERE name = 'background_pool_size') AS pool_size
+      SELECT
+        if(pool_size > 0,
+           round(maxIf(value, metric = 'BackgroundMergesAndMutationsPoolTask') * 100.0 / pool_size, 0), -1)
+            AS bg_pool_utilization,
+        toUInt64(maxIf(value, metric = 'BackgroundMergesAndMutationsPoolTask')) AS merge_queue_size,
+        toUInt64(pool_size) AS pool_size
+      FROM system.metrics
+    thresholds:
+      - { metric: bg_pool_utilization, op: gte, value: 80,  severity: warning }
+      - { metric: bg_pool_utilization, op: gte, value: 100, severity: critical }
+    threshold_version: 2
+    thresholds_updated_at: "2026-10-28T00:00:00Z"
+    thresholds_source: builtin
+    unit_map: { bg_pool_utilization: percent, merge_queue_size: count, pool_size: count }
+    owner: "clickwatch"
+    labels: [P1, background, daily]
+    notes: >-
+      Чек-лист п.33. Объединённый пул мерджей и мутаций появился в ~22.6 (конверсия метрика/пул
+      отличается в старых версиях). bg_pool_utilization = -1 при неизвестном размере пула.
+      Переименования под реестр ClickWatch: bg_pool_pct -> bg_pool_utilization (№63),
+      bg_tasks_active -> merge_queue_size (№62).
+
+  - id: 34
+    uid: "ch.background.mutation_merge_contention"
+    title_en: "Mutation-Merge Contention"
+    title_ru: "Конфликт мутаций и мерджей"
+    group: background
+    priority: P2
+    applies_to: [standalone, replicated]
+    scope: node
+    tables: [system.merges, system.mutations]
+    interval: 15m
+    query: |
+      SELECT
+        toUInt64((SELECT count() FROM system.merges WHERE is_mutation = 0))   AS running_merges,
+        toUInt64((SELECT count() FROM system.mutations WHERE is_done = 0))    AS running_mutations,
+        toUInt64((SELECT max(elapsed) FROM system.merges WHERE is_mutation = 1)) AS max_mutation_duration,
+        if((SELECT count() FROM system.mutations WHERE is_done = 0) > 10
+           AND (SELECT count() FROM system.merges WHERE is_mutation = 0) = 0, 1, 0) AS contention_flag
+    thresholds:
+      - { metric: contention_flag, op: gte, value: 1, severity: warning }
+    threshold_version: 2
+    thresholds_updated_at: "2026-10-28T00:00:00Z"
+    thresholds_source: builtin
+    unit_map: { contention_flag: count, running_merges: count, running_mutations: count,
+                max_mutation_duration: seconds }
+    owner: "clickwatch"
+    labels: [P2, background, weekly]
+    notes: >-
+      Чек-лист п.34. Ноль мерджей при десятке активных мутаций - фоновой пул перегружен мутациями.
+      max_mutation_duration - из merges WHERE is_mutation=1 (реестр №67): зависший мутационный
+      merge блокирует партицию.
+
+  # --------------------------------------------------------------------------
+  # Блок G. Компоненты и интеграции (чек-лист 35-43)
+  # --------------------------------------------------------------------------
+
+  - id: 35
+    uid: "ch.components.blob_storage"
+    title_en: "Blob Storage Errors"
+    title_ru: "Ошибки S3/blob storage"
+    group: components
+    priority: P2
+    applies_to: [standalone, replicated]
+    scope: node
+    tables: [system.blob_storage_log]
+    since: "23.2"
+    interval: 15m
+    query: |
+      SELECT
+        toUInt64(countIf(error != ''))  AS blob_errors_hour,
+        round(max(elapsed_microseconds) / 1000000, 1) AS max_blob_op_sec,
+        toUInt64(sumIf(data_size, event_type = 'Read'))   AS s3_bytes_read,
+        toUInt64(sumIf(data_size, event_type = 'Upload')) AS s3_bytes_written
+      FROM system.blob_storage_log
+      WHERE event_date >= today() - 1
+        AND event_time >= now() - INTERVAL 1 HOUR
+    thresholds:
+      - { metric: blob_errors_hour, op: gte, value: 10, severity: warning }
+      - { metric: max_blob_op_sec,  op: gte, value: 1,  severity: warning }
+    threshold_version: 1
+    thresholds_updated_at: "2026-10-28T00:00:00Z"
+    thresholds_source: builtin
+    unit_map: { blob_errors_hour: count, max_blob_op_sec: seconds,
+                s3_bytes_read: bytes, s3_bytes_written: bytes }
+    owner: "clickwatch"
+    labels: [P2, s3, daily]
+    notes: >-
+      Чек-лист п.35. Если хранение локальное, таблица пуста - правило просто "чисто".
+      Таблица появилась в ~23.2. Трафик S3: s3_bytes_read = сумма data_size операций
+      Read, s3_bytes_written = сумма data_size операций Upload (окно 1 ч; ноль операций
+      за окно = честный ноль, не пробел). Длительность - elapsed_microseconds (в ранних
+      23.x колонка называлась elapsed, там правило уйдёт в error_query, не задевая
+      остальные правила).
+
+  - id: 36
+    uid: "ch.components.filesystem_cache"
+    title_en: "Filesystem Cache Size"
+    title_ru: "Размер файлового кэша"
+    group: components
+    priority: P3
+    applies_to: [standalone, replicated]
+    scope: node
+    tables: [system.filesystem_cache]
+    since: "23.1"
+    interval: 1h
+    query: |
+      SELECT toUInt64(coalesce(sum(file_size), 0)) AS cache_size_bytes
+      FROM system.filesystem_cache
+    thresholds:
+      - { metric: cache_size_bytes, op: gte, value: 9000000000, severity: warning }
+    threshold_version: 1
+    thresholds_updated_at: "2026-10-28T00:00:00Z"
+    thresholds_source: builtin
+    unit_map: { cache_size_bytes: bytes }
+    owner: "clickwatch"
+    labels: [P3, cache, weekly]
+    notes: >-
+      Чек-лист п.36. Порог 90% от лимита кэша 10 ГиБ по умолчанию; dba правит под фактический
+      filesystem cache max_size. Если кэш не используется - результат 0 (правило "чисто").
+
+  - id: 37
+    uid: "ch.components.kafka_consumers"
+    title_en: "Kafka Consumer Lag"
+    title_ru: "Потребители Kafka"
+    group: components
+    priority: P3
+    applies_to: [standalone, replicated]
+    scope: node
+    tables: [system.kafka_consumers]
+    since: "24.4"
+    enabled: false
+    interval: 15m
+    query: |
+      SELECT
+        toUInt64(count()) AS consumers_active,
+        countIf(last_used > now() - INTERVAL 5 MINUTE)  AS consumers_recent
+      FROM system.kafka_consumers
+    thresholds: []
+    threshold_version: 1
+    thresholds_updated_at: "2026-10-28T00:00:00Z"
+    thresholds_source: builtin
+    unit_map: { consumers_active: count }
+    owner: "clickwatch"
+    labels: [P3, kafka, daily]
+    notes: >-
+      Чек-лист п.37. ВЫКЛЮЧЕНО по умолчанию: состав колонок system.kafka_consumers менялся
+      в 24.x-25.x; dba проверяет DESCRIBE и включает правило (enabled: true) после уточнения
+      запроса под свою версию. Таблица с ~24.4, в 23.x отсутствует.
+
+  - id: 38
+    uid: "ch.components.backups"
+    title_en: "Backup Health"
+    title_ru: "Состояние резервных копий"
+    group: components
+    priority: P3
+    applies_to: [standalone, replicated]
+    scope: node
+    tables: [system.backups]
+    since: "22.7"
+    interval: 1h
+    query: |
+      SELECT
+        toUInt64(countIf(error != '')) AS failed_backups_24h,
+        toUInt64(countIf(status = 'CREATING_BACKUP')) AS running_backups,
+        toUInt64(maxIf(dateDiff('second', start_time, end_time), status != 'CREATING_BACKUP'))
+                                                                                    AS backup_duration_sec
+      FROM system.backups
+      WHERE start_time >= now() - INTERVAL 24 HOUR
+    thresholds:
+      - { metric: failed_backups_24h, op: gte, value: 1, severity: warning }
+    threshold_version: 2
+    thresholds_updated_at: "2026-10-28T00:00:00Z"
+    thresholds_source: builtin
+    unit_map: { failed_backups_24h: count, running_backups: count, backup_duration_sec: seconds }
+    owner: "clickwatch"
+    labels: [P3, backup, weekly]
+    notes: >-
+      Чек-лист п.38. Применимо при использовании встроенного BACKUP/RESTORE;
+      статусы ('CREATING_BACKUP' и др.) сверены для 23.x-25.x.
+      backup_duration_sec = end_time - start_time (аналог elapsed реестра №12); идёт в SaaS
+      для сравнения с типовой длительностью (порог 2x - SaaS).
+      Источник остаётся system.backups (22.7+); system.backup_log (23.3+) - альтернатива.
+
+  - id: 39
+    uid: "ch.components.mv_refresh_errors"
+    title_en: "Materialized View Refresh Failures"
+    title_ru: "Сбои обновления MV"
+    group: components
+    priority: P3
+    applies_to: [standalone, replicated]
+    scope: node
+    tables: [system.query_log]
+    interval: 1h
+    query: |
+      SELECT
+        toUInt64(countIf(query ILIKE '%materialized%')) AS mv_errors_24h
+      FROM system.query_log
+      WHERE type = 'ExceptionWhileProcessing'
+        AND event_date >= today() - 1
+        AND event_time >= now() - INTERVAL 24 HOUR
+    thresholds:
+      - { metric: mv_errors_24h, op: gte, value: 1, severity: warning }
+    threshold_version: 1
+    thresholds_updated_at: "2026-10-28T00:00:00Z"
+    thresholds_source: builtin
+    unit_map: { mv_errors_24h: count }
+    owner: "clickwatch"
+    labels: [P3, mv, weekly]
+    notes: >-
+      Чек-лист п.39. Эвристика по тексту запроса в трейсе исключений; в 24.x+ добавляется
+      точное поле DependencyRefresh (дополнить запрос при 24.x+ по желанию dba). Тексты запросов
+      в sample маскируются (redact_columns).
+
+  - id: 40
+    uid: "ch.components.schema_fingerprint"
+    title_en: "Schema Drift"
+    title_ru: "Отпечаток схемы"
+    group: components
+    priority: P3
+    applies_to: [standalone, replicated]
+    scope: saas
+    tables: [system.columns]
+    interval: 24h
+    query: |
+      SELECT
+        hex(SHA256(toString(arraySort(groupArray(s))))) AS schema_fingerprint,
+        toUInt64(count()) AS tables_tracked
+      FROM
+      (
+        SELECT database, `table`, count() AS cnt, concat(database, '.', `table`, ':', toString(cnt)) AS s
+        FROM system.columns
+        GROUP BY database, `table`
+      )
+    thresholds: []
+    threshold_version: 1
+    thresholds_updated_at: "2026-10-28T00:00:00Z"
+    thresholds_source: builtin
+    unit_map: { tables_tracked: count }
+    owner: "clickwatch"
+    labels: [P3, schema, weekly]
+    notes: >-
+      Чек-лист п.40. SaaS сравнивает отпечаток между нодами кластера и против эталонной версии.
+
+  - id: 41
+    uid: "ch.components.network_saturation"
+    title_en: "Network Saturation"
+    title_ru: "Насыщение сети"
+    group: components
+    priority: P3
+    applies_to: [standalone, replicated]
+    scope: node
+    tables: [system.metric_log]
+    since: "22.0"
+    interval: 15m
+    query: |
+      SELECT
+        round((max(NetworkReceiveBytes) - min(NetworkReceiveBytes)) / 900 / 1048576, 1) AS recv_mbps,
+        round((max(NetworkSendBytes) - min(NetworkSendBytes)) / 900 / 1048576, 1)       AS send_mbps,
+        toUInt64(max(ProfileEvent.NetworkError) - min(ProfileEvent.NetworkError))       AS network_errors,
+        round((max(ProfileEvent.InterserverSendBytes)
+             - min(ProfileEvent.InterserverSendBytes)) / 900, 1)                        AS interserver_send_bytes,
+        round((max(ProfileEvent.InterserverReceiveBytes)
+             - min(ProfileEvent.InterserverReceiveBytes)) / 900, 1)                     AS interserver_receive_bytes
+      FROM system.metric_log
+      WHERE event_date >= today() - 1
+        AND event_time >= now() - INTERVAL 15 MINUTE
+        AND NetworkReceiveBytes > 0
+    thresholds:
+      - { metric: recv_mbps, op: gte, value: 500,  severity: warning }
+      - { metric: recv_mbps, op: gte, value: 1000, severity: critical }
+    threshold_version: 2
+    thresholds_updated_at: "2026-10-28T00:00:00Z"
+    thresholds_source: builtin
+    unit_map: { recv_mbps: mbps, send_mbps: mbps, network_errors: count,
+                interserver_send_bytes: mbps, interserver_receive_bytes: mbps }
+    owner: "clickwatch"
+    labels: [P3, network, weekly]
+    notes: >-
+      Чек-лист п.41. Дефолтные пороги под 10G-линк; dba правит под фактический интерфейс.
+      Добавлены сетевые ошибки (реестр №98) и interserver-поток между шардами (№99-100),
+      байт/с = дельта профилей за окно 15 мин.
+
+  - id: 42
+    uid: "ch.components.privileged_changes"
+    title_en: "Privileged Changes"
+    title_ru: "Привилегированные изменения (GRANT/USER)"
+    group: components
+    priority: P3
+    applies_to: [standalone, replicated]
+    scope: node
+    tables: [system.query_log]
+    interval: 24h
+    query: |
+      SELECT toUInt64(countIf(query ILIKE 'grant %' OR query ILIKE 'alter user %' OR query ILIKE 'create user %'))
+             AS privileged_queries_24h
+      FROM system.query_log
+      WHERE type = 'QueryStart'
+        AND event_date >= today() - 1
+        AND event_time >= now() - INTERVAL 24 HOUR
+    thresholds:
+      - { metric: privileged_queries_24h, op: gte, value: 5, severity: warning }
+    threshold_version: 1
+    thresholds_updated_at: "2026-10-28T00:00:00Z"
+    thresholds_source: builtin
+    unit_map: { privileged_queries_24h: count }
+    owner: "security@company"
+    labels: [P3, security, weekly]
+    notes: >-
+      Чек-лист п.42. Индикатор нештатных действий с правами; SaaS коррелирует с session_log.
+
+  - id: 43
+    uid: "ch.components.growth_forecast"
+    title_en: "Data Growth Forecast"
+    title_ru: "Объёмы данных (прогноз пустого диска)"
+    group: components
+    priority: P3
+    applies_to: [standalone, replicated]
+    scope: saas
+    tables: [system.tables]
+    interval: 6h
+    query: |
+      SELECT
+        toUInt64(sum(total_bytes))       AS total_bytes,
+        toUInt64(count())                AS tables_count,
+        hostname() AS hostname
+      FROM system.tables
+      WHERE total_bytes IS NOT NULL
+    thresholds: []
+    threshold_version: 1
+    thresholds_updated_at: "2026-10-28T00:00:00Z"
+    thresholds_source: builtin
+    unit_map: { total_bytes: bytes, tables_count: count }
+    owner: "clickwatch"
+    labels: [P3, capacity, weekly]
+    notes: >-
+      Чек-лист п.43. SaaS строит тренд по истории измерений и прогнозирует заполнение диска.
+
+  # --------------------------------------------------------------------------
+  # Расширение за пределами чек-листа (id 44-46, метрики реестра ClickWatch,
+  # см. реестр метрик ClickWatch §10). Можно отключить локальным override (enabled: false).
+  # --------------------------------------------------------------------------
+
+  - id: 44
+    uid: "ch.host.resources"
+    title_en: "Host Resources (RAM/CPU/Load)"
+    title_ru: "Ресурсы ноды (RAM/CPU/load)"
+    group: components
+    priority: P1
+    applies_to: [standalone, replicated]
+    scope: node
+    tables: [system.asynchronous_metrics]
+    since: "20.13"
+    interval: 5m
+    query: |
+      SELECT
+        round((maxIf(v, m = 'OSMemoryTotal') - maxIf(v, m = 'OSMemoryAvailable')) * 100.0
+              / nullIf(maxIf(v, m = 'OSMemoryTotal'), 0), 1)                    AS ram_used_pct,
+        toUInt64(maxIf(v, m = 'OSMemoryAvailable'))                             AS ram_available,
+        toUInt64(maxIf(v, m = 'OSMemoryTotal'))                                 AS ram_total,
+        toUInt64(maxIf(v, m = 'OpenFileDescriptors'))                           AS open_file_descriptors,
+        toUInt64(maxIf(v, m = 'PageCacheSize'))                                 AS page_cache_size,
+        toUInt64(maxIf(v, m = 'Uptime'))                                        AS uptime_seconds,
+        round(maxIf(v, m = 'LoadAverage1'), 2)                                  AS load_avg_1m,
+        round(maxIf(v, m = 'LoadAverage5'), 2)                                  AS load_avg_5m,
+        round(maxIf(v, m = 'LoadAverage15'), 2)                                 AS load_avg_15m,
+        toUInt64(maxIf(v, m = 'ThreadingThreads'))                              AS threads_count,
+        round(maxIf(v, m = 'ContextSwitchRate'), 1)                             AS context_switch_rate,
+        toUInt64(maxIf(v, m = 'CPUUserTime'))                                   AS cpu_user,
+        toUInt64(maxIf(v, m = 'CPUSystemTime'))                                 AS cpu_system
+      FROM
+      (
+        SELECT metric AS m, value AS v
+        FROM system.asynchronous_metrics
+        WHERE metric IN ('OSMemoryTotal', 'OSMemoryAvailable', 'OpenFileDescriptors',
+                         'PageCacheSize', 'Uptime', 'LoadAverage1', 'LoadAverage5',
+                         'LoadAverage15', 'ThreadingThreads', 'ContextSwitchRate',
+                         'CPUUserTime', 'CPUSystemTime')
+      )
+    thresholds:
+      - { metric: ram_used_pct,  op: gte, value: 90, severity: warning }
+      - { metric: ram_used_pct,  op: gte, value: 95, severity: critical }
+      - { metric: load_avg_1m,   op: gte, value: 4,  severity: warning }
+      - { metric: load_avg_1m,   op: gte, value: 8,  severity: critical }
+    threshold_version: 1
+    thresholds_updated_at: "2026-10-28T00:00:00Z"
+    thresholds_source: builtin
+    unit_map: { ram_used_pct: percent, ram_available: bytes, ram_total: bytes, page_cache_size: bytes,
+                uptime_seconds: seconds, threads_count: count,
+                context_switch_rate: count, cpu_user: seconds, cpu_system: seconds }
+    owner: "clickwatch"
+    labels: [P1, host, daily]
+    notes: >-
+      Вне чек-листа. Покрывает критичные метрики реестра ClickWatch №19-21, 29, 31,
+      35-44 (крупнейший пробел 43-пунктового набора - нет CPU/RAM/load).
+      cpu_user/cpu_system - кумулятивные секунды; cpu_usage (rate) считает SaaS.
+      Пороги load_avg_1m поднять на многоядерных нодах; open_file_descriptors - без
+      порога (лимит ОС хоста неизвестен), контроль деградации дашбордом.
+
+  - id: 45
+    uid: "ch.gauges.core_counters"
+    title_en: "Core Counters / Gauges Snapshot"
+    title_ru: "Снимок счётчиков и gauge (поток для SaaS)"
+    group: components
+    priority: P3
+    applies_to: [standalone, replicated]
+    scope: node
+    tables: [system.events, system.metrics, system.asynchronous_metrics]
+    since: "20.4"
+    interval: 5m
+    query: |
+      WITH
+        ev AS
+        (
+          SELECT
+            maxIf(value, event = 'Query')                          AS ev_query,
+            maxIf(value, event = 'SelectedRows')                   AS ev_selected_rows,
+            maxIf(value, event = 'InsertedRows')                   AS ev_inserted_rows,
+            maxIf(value, event = 'FailedQuery')                    AS ev_failed_query,
+            maxIf(value, event = 'FailedSelectQuery')              AS ev_failed_select_query,
+            maxIf(value, event = 'FailedInsertQuery')              AS ev_failed_insert_query,
+            maxIf(value, event = 'CancelledQuery')                 AS ev_cancelled_query,
+            maxIf(value, event = 'OutOfMemory')                    AS ev_out_of_memory,
+            maxIf(value, event = 'ReadBytes')                      AS ev_read_bytes,
+            maxIf(value, event = 'WrittenBytes')                   AS ev_written_bytes,
+            maxIf(value, event = 'ReadRows')                       AS ev_read_rows,
+            maxIf(value, event = 'ResultRows')                     AS ev_result_rows,
+            maxIf(value, event = 'ReadBytesCompressed')            AS ev_read_bytes_compressed,
+            maxIf(value, event = 'NetworkReceiveBytes')            AS ev_network_receive_bytes,
+            maxIf(value, event = 'NetworkSendBytes')               AS ev_network_send_bytes,
+            maxIf(value, event = 'NetworkReceiveTimeout')          AS ev_network_receive_timeout,
+            maxIf(value, event = 'NetworkSendTimeout')             AS ev_network_send_timeout,
+            maxIf(value, event = 'NetworkError')                   AS ev_network_error,
+            maxIf(value, event = 'InterserverSendBytes')           AS ev_interserver_send_bytes,
+            maxIf(value, event = 'InterserverReceiveBytes')        AS ev_interserver_receive_bytes,
+            maxIf(value, event = 'MarkCacheHits')                  AS ev_mark_cache_hits,
+            maxIf(value, event = 'MarkCacheMisses')                AS ev_mark_cache_misses,
+            maxIf(value, event = 'UncompressedCacheHits')          AS ev_uncompressed_cache_hits,
+            maxIf(value, event = 'UncompressedCacheMisses')        AS ev_uncompressed_cache_misses,
+            maxIf(value, event = 'CompileFunction')                AS ev_compile_function,
+            maxIf(value, event = 'CompressedReadBufferBlocks')     AS ev_compressed_read_buffer_blocks,
+            maxIf(value, event = 'ReplicaPartMerges')              AS ev_replica_part_merges,
+            maxIf(value, event = 'ReplicatedPartMerges')           AS ev_replicated_part_merges,
+            maxIf(value, event = 'ReplicatedPartFetches')          AS ev_replicated_part_fetches,
+            maxIf(value, event = 'ZooKeeperHardwareExceptions')    AS ev_zk_hardware_exceptions,
+            maxIf(value, event = 'ZooKeeperUserExceptions')        AS ev_zk_user_exceptions,
+            maxIf(value, event = 'DistributedSendTimeoutCount')    AS ev_distributed_send_timeout
+          FROM system.events
+        ),
+        mg AS
+        (
+          SELECT
+            maxIf(value, metric = 'MarkCacheBytes')                AS g_mark_cache_bytes,
+            maxIf(value, metric = 'UncompressedCacheBytes')        AS g_uncompressed_cache_bytes,
+            maxIf(value, metric = 'PageCacheSize')                 AS g_page_cache_size,
+            maxIf(value, metric = 'MMappedFileCount')              AS g_mmapped_files,
+            maxIf(value, metric = 'MMappedFileBytes')              AS g_mmapped_file_size,
+            maxIf(value, metric = 'DistributedDirectoryCount')     AS g_distributed_directories,
+            maxIf(value, metric = 'DiskSpaceUsed')                 AS g_disk_space_used,
+            maxIf(value, metric = 'ZooKeeperConnections')          AS g_zk_connections,
+            maxIf(value, metric = 'ThreadingThreads')              AS g_threads_count
+          FROM system.asynchronous_metrics
+        ),
+        mt AS
+        (
+          SELECT
+            maxIf(value, metric = 'InterserverConnections')        AS g_interserver_connections,
+            maxIf(value, metric = 'HTTPConnection')                AS g_http_connections,
+            maxIf(value, metric = 'TCPConnection')                 AS g_tcp_connections,
+            maxIf(value, metric = 'DistributedSend')               AS g_distributed_send,
+            maxIf(value, metric = 'BackgroundSchedulePoolTask')    AS g_bg_schedule_pool,
+            maxIf(value, metric = 'BackgroundMovePoolTask')        AS g_bg_move_pool
+          FROM system.metrics
+        )
+      SELECT ev.*, mg.*, mt.* FROM ev, mg, mt
+    thresholds: []
+    threshold_version: 1
+    thresholds_updated_at: "2026-10-28T00:00:00Z"
+    thresholds_source: builtin
+    unit_map: { ev_query: count, ev_selected_rows: count, ev_inserted_rows: count,
+                ev_failed_query: count, ev_failed_select_query: count, ev_failed_insert_query: count,
+                ev_cancelled_query: count, ev_out_of_memory: count, ev_read_bytes: bytes,
+                ev_written_bytes: bytes, ev_read_rows: count, ev_result_rows: count,
+                ev_read_bytes_compressed: bytes, ev_network_receive_bytes: bytes, ev_network_send_bytes: bytes,
+                ev_network_receive_timeout: count, ev_network_send_timeout: count, ev_network_error: count,
+                ev_interserver_send_bytes: bytes, ev_interserver_receive_bytes: bytes,
+                ev_mark_cache_hits: count, ev_mark_cache_misses: count,
+                ev_uncompressed_cache_hits: count, ev_uncompressed_cache_misses: count,
+                ev_compile_function: count, ev_compressed_read_buffer_blocks: count,
+                ev_replica_part_merges: count, ev_replicated_part_merges: count,
+                ev_replicated_part_fetches: count, ev_zk_hardware_exceptions: count,
+                ev_zk_user_exceptions: count, ev_distributed_send_timeout: count,
+                g_mark_cache_bytes: bytes, g_uncompressed_cache_bytes: bytes, g_page_cache_size: bytes,
+                g_mmapped_files: count, g_mmapped_file_size: bytes, g_distributed_directories: count,
+                g_disk_space_used: bytes, g_zk_connections: count, g_threads_count: count,
+                g_interserver_connections: count, g_http_connections: count, g_tcp_connections: count,
+                g_distributed_send: count, g_bg_schedule_pool: count, g_bg_move_pool: count }
+    owner: "clickwatch"
+    labels: [P3, telemetry, daily]
+    notes: >-
+      Вне чек-листа. Снимок кумулятивных счётчиков (rate/delta и hit-rate считает SaaS -
+      как бэкенд ClickWatch; реестр №14-15, 17-18, 53-56, 83, 85-87, 95, 106-112).
+      0 для отсутствующего в версии события - норма, ошибки не порождает.
+
+  - id: 46
+    uid: "ch.state.keeper_connection"
+    title_en: "Keeper Connection Status"
+    title_ru: "Статус соединения с Keeper"
+    group: dbms_state
+    priority: P1
+    applies_to: [replicated]
+    scope: node
+    tables: [system.zookeeper_connection]
+    since: "25.0"
+    interval: 15m
+    query: |
+      SELECT toUInt64(max(value)) AS zk_connection_status
+      FROM system.zookeeper_connection
+    thresholds:
+      - { metric: zk_connection_status, op: lt, value: 1, severity: critical }
+    threshold_version: 1
+    thresholds_updated_at: "2026-10-28T00:00:00Z"
+    thresholds_source: builtin
+    unit_map: { zk_connection_status: count }
+    owner: "clickwatch"
+    labels: [P1, replication, keeper, daily]
+    notes: >-
+      Вне чек-листа. Реестр №88 (25.x+). Отдельное правило, а не колонка id 22 (§12.6):
+      таблицы нет на кластерах 21.8-24.x, правило целиком уходит в skip
+      (skipped_unsupported по since 25.0 / skipped_table_missing по доступу),
+      не задев остальную телеметрию Keeper.
+
+  - id: 47
+    uid: "ch.parts.duplicates"
+    title_en: "Duplicated Parts"
+    title_ru: "Дубликаты частей"
+    group: parts_disk
+    priority: P3
+    applies_to: [standalone, replicated]
+    scope: node
+    tables: [system.parts]
+    since: "21.8"
+    interval: 15m
+    query: |
+      SELECT
+        toUInt64(sum(dup.extras))    AS duplicate_parts,
+        toUInt64(count())            AS duplicate_groups,
+        toUInt64(sum(dup.total_bytes)) AS duplicate_parts_bytes
+      FROM
+      (
+        SELECT database, table, hash_of_all_files,
+               count() - 1 AS extras,
+               sum(bytes_on_disk) AS total_bytes
+        FROM system.parts
+        WHERE active = 1
+          AND database NOT IN ('system', 'INFORMATION_SCHEMA', 'information_schema')
+        GROUP BY database, table, hash_of_all_files
+        HAVING count() > 1
+      ) AS dup
+    thresholds:
+      - { metric: duplicate_parts, op: gte, value: 1,  severity: warning }
+      - { metric: duplicate_parts, op: gte, value: 50, severity: critical }
+    threshold_version: 1
+    thresholds_updated_at: "2026-10-28T00:00:00Z"
+    thresholds_source: builtin
+    unit_map: { duplicate_parts: count, duplicate_groups: count, duplicate_parts_bytes: bytes }
+    owner: "clickwatch"
+    labels: [P3, parts, daily]
+    notes: >-
+      Вне чек-листа (расширение п.8). Закрывает m_duplicated_parts коллектора r620:
+      одинаковые по hash_of_all_files активные части одной таблицы = лишние копии
+      (после восстановления из бэкапа, ручных copy/data-операций, разъезда реплик).
+      Хеш включает имена файлов внутри части, разные части с равным хешем -
+      фактически идентичные данные. Пустой выбор = 0 (полная агрегация, не NULL).
+      duplicate_groups - число групп дубликатов, duplicate_parts_bytes - суммарный
+      объём всех частей, входящих в такие группы.
+
+  - id: 48
+    uid: "ch.state.settings_values"
+    title_en: "Settings Values (profile / server / merge_tree)"
+    title_ru: "Значения настроек трех уровней"
+    group: dbms_state
+    priority: P3
+    applies_to: [standalone, replicated]
+    scope: saas
+    tables: [system.settings, system.server_settings, system.merge_tree_settings]
+    since: "23.11"
+    interval: 1h
+    query: |
+      SELECT
+        toInt64OrNull(maxIf(value, name = 'max_memory_usage'))              AS max_memory_usage_bytes,
+        toInt64OrNull(maxIf(value, name = 'max_memory_usage_for_user'))     AS max_memory_usage_for_user_bytes,
+        toInt64OrNull(maxIf(value, name = 'max_concurrent_queries'))        AS max_concurrent_queries,
+        toInt64OrNull(maxIf(value, name = 'max_execution_time'))            AS max_execution_time_s,
+        toInt64OrNull(maxIf(value, name = 'max_threads'))                   AS max_threads,
+        toInt64OrNull(maxIf(value, name = 'max_insert_threads'))            AS max_insert_threads,
+        toInt64OrNull(maxIf(value, name = 'max_block_size'))                AS max_block_size,
+        toInt64OrNull(maxIf(value, name = 'max_insert_block_size'))         AS max_insert_block_size,
+        toInt64OrNull(maxIf(value, name = 'max_bytes_before_external_group_by')) AS max_bytes_before_external_group_by,
+        toInt64OrNull(maxIf(value, name = 'max_bytes_before_external_sort'))     AS max_bytes_before_external_sort,
+        toInt64OrNull(maxIf(value, name = 'distributed_aggregation_memory_efficient')) AS distributed_aggregation_memory_efficient,
+        toInt64OrNull(maxIf(value, name = 'use_async_insert'))              AS use_async_insert,
+        toInt64OrNull(maxIf(value, name = 'async_insert_max_data_size'))    AS async_insert_max_data_size,
+        toInt64OrNull(maxIf(value, name = 'async_insert_max_query_number')) AS async_insert_max_query_number,
+        toInt64OrNull(maxIf(value, name = 'mutations_sync'))                AS mutations_sync,
+        toInt64OrNull(maxIf(value, name = 'max_connections'))               AS max_connections,
+        toFloat64OrNull(maxIf(value, name = 'http_keep_alive_timeout'))     AS http_keep_alive_timeout,
+        toInt64OrNull(maxIf(value, name = 'background_pool_size'))          AS background_pool_size,
+        toInt64OrNull(maxIf(value, name = 'background_merges_mutations_pool_size')) AS background_merges_mutations_pool_size,
+        toFloat64OrNull(maxIf(value, name = 'background_merges_mutations_concurrency_ratio')) AS background_merges_mutations_concurrency_ratio,
+        toInt64OrNull(maxIf(value, name = 'max_part_mutations'))            AS max_part_mutations,
+        toInt64OrNull(maxIf(value, name = 'max_replicated_merges_in_queue')) AS max_replicated_merges_in_queue,
+        toInt64OrNull(maxIf(value, name = 'lightweight_deletes_sync'))      AS lightweight_deletes_sync,
+        toInt64OrNull(maxIf(value, name = 'distributed_directory_monitor_sleep_time_ms')) AS distributed_directory_monitor_sleep_time_ms,
+        toInt64OrNull(maxIf(value, name = 'parts_to_delay_insert'))         AS parts_to_delay_insert,
+        toInt64OrNull(maxIf(value, name = 'parts_to_throw_insert'))         AS parts_to_throw_insert,
+        toInt64OrNull(maxIf(value, name = 'max_parts_to_merge_at_once'))    AS max_parts_to_merge_at_once,
+        toInt64OrNull(maxIf(value, name = 'min_compress_block_size'))       AS min_compress_block_size,
+        toInt64OrNull(maxIf(value, name = 'max_compress_block_size'))       AS max_compress_block_size
+      FROM
+      (
+        SELECT name,
+               if(value IN ('true', '1'), '1', if(value IN ('false', '0'), '0', toString(value))) AS value
+        FROM system.settings
+        WHERE name IN
+        (
+          'max_memory_usage', 'max_memory_usage_for_user', 'max_concurrent_queries',
+          'max_execution_time', 'max_threads', 'max_insert_threads', 'max_block_size',
+          'max_insert_block_size', 'max_bytes_before_external_group_by',
+          'max_bytes_before_external_sort', 'distributed_aggregation_memory_efficient',
+          'use_async_insert', 'async_insert_max_data_size', 'async_insert_max_query_number',
+          'mutations_sync'
+        )
+        UNION ALL
+        SELECT name,
+               if(value IN ('true', '1'), '1', if(value IN ('false', '0'), '0', toString(value))) AS value
+        FROM system.server_settings
+        WHERE name IN
+        (
+          'max_connections', 'http_keep_alive_timeout', 'background_pool_size',
+          'background_merges_mutations_pool_size', 'background_merges_mutations_concurrency_ratio',
+          'max_part_mutations', 'max_replicated_merges_in_queue', 'lightweight_deletes_sync',
+          'distributed_directory_monitor_sleep_time_ms'
+        )
+        UNION ALL
+        SELECT name,
+               if(value IN ('true', '1'), '1', if(value IN ('false', '0'), '0', toString(value))) AS value
+        FROM system.merge_tree_settings
+        WHERE name IN
+        (
+          'parts_to_delay_insert', 'parts_to_throw_insert', 'max_parts_to_merge_at_once',
+          'min_compress_block_size', 'max_compress_block_size', 'mutations_sync',
+          'lightweight_deletes_sync'
+        )
+      )
+    thresholds: []
+    threshold_version: 1
+    thresholds_updated_at: "2026-10-28T00:00:00Z"
+    thresholds_source: builtin
+    unit_map: { max_memory_usage_bytes: bytes, max_memory_usage_for_user_bytes: bytes,
+                max_concurrent_queries: count, max_execution_time_s: seconds, max_threads: count,
+                max_insert_threads: count, max_block_size: count, max_insert_block_size: count,
+                max_bytes_before_external_group_by: bytes, max_bytes_before_external_sort: bytes,
+                distributed_aggregation_memory_efficient: count, use_async_insert: count,
+                async_insert_max_data_size: bytes, async_insert_max_query_number: count,
+                mutations_sync: count, max_connections: count, http_keep_alive_timeout: seconds,
+                background_pool_size: count, background_merges_mutations_pool_size: count,
+                background_merges_mutations_concurrency_ratio: ratio, max_part_mutations: count,
+                max_replicated_merges_in_queue: count, lightweight_deletes_sync: count,
+                distributed_directory_monitor_sleep_time_ms: ms, parts_to_delay_insert: count,
+                parts_to_throw_insert: count, max_parts_to_merge_at_once: count,
+                min_compress_block_size: count, max_compress_block_size: count }
+    owner: "clickwatch"
+    labels: [P3, config, daily]
+    notes: >-
+      Вне чек-листа. Добавлено по результатам сверки с коллектором r620 (§7-§10):
+      полный числовой снимок настроек вместо одного отпечатка (id 28) - заполняет
+      колонки g_* таблицы agent_metrics и даёт материал для аудита настроек
+      (global_settings_history: SaaS сравнивает последовательные снимки).
+      Три источника: профильные настройки (system.settings), серверные
+      (system.server_settings, есть с 23.11 - поэтому since 23.11),
+      MergeTree (system.merge_tree_settings). Булевы значения 'true'/'false'
+      мапятся в 1/0, отсутствующее имя даёт NULL (пропуск серии, не ноль).
+      Пересечение имён между sources (mutations_sync, lightweight_deletes_sync)
+      допустимо - значения совпадают. Единицы: байты, секунды, мс, счётчик,
+      коэффициент (unit_map).
+
+  - id: 49
+    uid: "ch.state.tables"
+    title_en: "Tables Inventory (per node)"
+    title_ru: "Перечень таблиц ноды"
+    group: dbms_state
+    priority: P3
+    applies_to: [standalone, replicated]
+    scope: saas
+    tables: [system.tables, system.parts, system.replicas]
+    since: "20.7"
+    interval: 1h
+    query: |
+      -- Многострочная выдача (sample-канал, не агрегат): строка на таблицу
+      -- ноды. В SaaS уходит в clickwatch.agent_tables_log; в проекцию
+      -- agent_metrics НЕ проецируется (как ch.queries.raw_log).
+      SELECT
+        t.database        AS database,
+        t.name            AS table,
+        t.engine          AS engine,
+        t.partition_key   AS partition_key,
+        if(positionCaseInsensitive(t.engine_full, 'TTL') > 0,
+           substring(t.engine_full, positionCaseInsensitive(t.engine_full, 'TTL'), 200),
+           '')            AS ttl,
+        if(startsWith(t.engine, 'Replicated'),
+           replaceAll(substring(t.engine_full, position(t.engine_full, '(') + 1,
+                      position(t.engine_full, ',') - position(t.engine_full, '(') - 1),
+                      '''', ''),
+           '')            AS zpath,
+        coalesce(p.total_rows, 0)  AS rows,
+        coalesce(p.total_bytes, 0) AS bytes,
+        coalesce(p.parts_cnt, 0)   AS parts
+      FROM system.tables AS t
+      LEFT JOIN
+      (
+        SELECT database, table, sum(rows) AS total_rows, sum(bytes) AS total_bytes,
+               count() AS parts_cnt
+        FROM system.parts WHERE active GROUP BY database, table
+      ) AS p ON p.database = t.database AND p.table = t.name
+      WHERE t.database NOT IN ('system', 'information_schema', 'INFORMATION_SCHEMA')
+    thresholds: []
+    threshold_version: 1
+    thresholds_updated_at: "2026-11-05T00:00:00Z"
+    thresholds_source: builtin
+    unit_map: { rows: count, bytes: bytes, parts: count }
+    owner: "clickwatch"
+    labels: [P3, inventory, hourly]
+    notes: >-
+      Перечень таблиц ноды (задание 2026-11-05, ж129): база + таблица +
+      движок + ключ партиционирования / TTL из engine_full + счётчики
+      строк/объёма/частей на ноде. Путь реплики (zpath) лучше брать из
+      system.replicas.zookeeper_path - он уже интерполирован по ноде
+      (у реплик одного набора путь одинаковый, у шардов разный); в
+      эталонной выборке путь вытащен из engine_full с макросами -
+      реализующие агенты (python) шлют zookeeper_path. system.* и
+      information_schema не собираются. Проверки_cliente страницы
+      (расхождение реплик, таблица есть не на всех нодах, рост без TTL)
+      считаются на сервере; детектор из этого канала не читает.
+
+  # --------------------------------------------------------------------------
+  # Блок G. Сводка ошибок по группам (вне чек-листа; решения 2026-11-10, ж248/252)
+  # --------------------------------------------------------------------------
+
+  - id: 50
+    uid: "ch.errors.top_texts"
+    title_en: "Error Groups Fact (5 slots, 24h)"
+    title_ru: "Сводка ошибок по группам (5 слотов, 24 ч)"
+    group: dbms_state
+    priority: P3
+    applies_to: [standalone, replicated]
+    scope: node
+    tables: [system.query_log, system.text_log]
+    interval: 15m
+    query: |
+      -- Сводка-факт «первопричина»: ОШИБКИ ПО ГРУППАМ за 24 ч, БЕЗ порогов
+      -- (решение заказчика 2026-11-10: детали не нужны — только факт:
+      -- тип ошибки (по группе), счёт повторов и время последнего).
+      -- Инциденты правило само не открывает. Группы по коду:
+      -- Лимиты памяти (241/242), Таймауты (159/160), Read-only реплики
+      -- (514/515/516), Доступ и права (497), Прочие; сбои журнала сервера
+      -- (text_log Error/Fatal) — отдельная группа «Ядро (журнал)».
+      -- Механика runner: метрики собираются ТОЛЬКО из первой строки
+      -- результата, поэтому топ-5 групп — колонки-слоты err1..err5
+      -- (счёт) и err1_text..err5_text («группа · последний НН:ММ:СС»,
+      -- нечисловое значение приёмник кладёт в value_text).
+      WITH
+      g AS
+      (
+        SELECT
+          multiIf(exception_code IN (241, 242), 'Лимиты памяти',
+                  exception_code IN (159, 160), 'Таймауты',
+                  exception_code IN (514, 515, 516), 'Read-only реплики',
+                  exception_code = 497, 'Доступ и права',
+                  'Прочие')            AS grp,
+          count()                      AS c,
+          max(event_time)              AS t
+        FROM system.query_log
+        WHERE event_date >= today() - 2
+          AND event_time >= now() - INTERVAL 24 HOUR
+          AND exception != ''
+        GROUP BY grp
+      ),
+      l AS
+      (
+        SELECT 'Ядро (журнал)'         AS grp,
+               count()                 AS c,
+               max(event_time)         AS t
+        FROM system.text_log
+        WHERE event_date >= today() - 2
+          AND event_time >= now() - INTERVAL 24 HOUR
+          AND level IN ('Error', 'Fatal')
+      ),
+      agg AS
+      (
+        SELECT grp, sum(c) AS c, max(t) AS t
+        FROM (SELECT grp, c, t FROM g UNION ALL SELECT grp, c, t FROM l)
+        GROUP BY grp
+        ORDER BY c DESC, t DESC
+        LIMIT 5
+      ),
+      a AS
+      (
+        SELECT count()             AS n,
+               groupArray(grp)     AS a_grp,
+               groupArray(c)       AS a_c,
+               groupArray(t)       AS a_t
+        FROM agg
+      )
+      SELECT
+        toUInt64(arrayElement(a_c, 1)) AS err1,
+        toUInt64(arrayElement(a_c, 2)) AS err2,
+        toUInt64(arrayElement(a_c, 3)) AS err3,
+        toUInt64(arrayElement(a_c, 4)) AS err4,
+        toUInt64(arrayElement(a_c, 5)) AS err5,
+        if(arrayElement(a_c, 1) = 0, '', substring(concat(
+          arrayElement(a_grp, 1), ' · последний ',
+          formatDateTime(arrayElement(a_t, 1), '%H:%i:%S')), 1, 200)) AS err1_text,
+        if(arrayElement(a_c, 2) = 0, '', substring(concat(
+          arrayElement(a_grp, 2), ' · последний ',
+          formatDateTime(arrayElement(a_t, 2), '%H:%i:%S')), 1, 200)) AS err2_text,
+        if(arrayElement(a_c, 3) = 0, '', substring(concat(
+          arrayElement(a_grp, 3), ' · последний ',
+          formatDateTime(arrayElement(a_t, 3), '%H:%i:%S')), 1, 200)) AS err3_text,
+        if(arrayElement(a_c, 4) = 0, '', substring(concat(
+          arrayElement(a_grp, 4), ' · последний ',
+          formatDateTime(arrayElement(a_t, 4), '%H:%i:%S')), 1, 200)) AS err4_text,
+        if(arrayElement(a_c, 5) = 0, '', substring(concat(
+          arrayElement(a_grp, 5), ' · последний ',
+          formatDateTime(arrayElement(a_t, 5), '%H:%i:%S')), 1, 200)) AS err5_text
+      FROM a
+    thresholds: []
+    threshold_version: 1
+    thresholds_updated_at: "2026-11-10T00:00:00Z"
+    thresholds_source: builtin
+    unit_map: { err1: count, err2: count, err3: count, err4: count, err5: count,
+                err1_text: text, err2_text: text, err3_text: text,
+                err4_text: text, err5_text: text }
+    owner: "clickwatch"
+    labels: [P3, errors, 15m]
+    notes: >-
+      Вне чек-листа. Задание 2026-11-10 (ж248): тексты ошибок ClickHouse
+      от агента в витрину - сводка-факт, а не сырой лог. ДУТУ во втором
+      раунде (ж252, тот же день): «по текстам ошибок детали не нужны -
+      только факт»: ошибки делятся на ГРУППЫ, в карточке говорят о факте
+      ошибки, времени и типе (по группе). Группы по коду: Лимиты памяти
+      (241/242), Таймауты (159/160), Read-only реплики (514/515/516),
+      Доступ и права (497), Прочие; сбои text_log Error/Fatal - «Ядро
+      (журнал)». слоты err1..err5 - топ-5 групп по счёту за 24 ч
+      (value = число повторов), err1_text..err5_text (value_text) -
+      «Группа · последний НН:ММ:СС» (время локальное сервера CH).
+      Сообщения, пользователи, QueryID и тексты запросов НЕ передаются.
+      Механика runner (метрики только из первой строки) диктует пивот
+      в одну строку. Пустые слоты: счёт 0 и пустая строка (точка без
+      значения не пишется). Правило БЕЗ порогов: инциденты оно не
+      открывает (штатные числовые каналы остаются единственным триггером),
+      витрина подписывает первопричину фактами этой сводки.
+      Слияние слоёв: отключение - локальный overlay (enabled: false)
+      или слой SaaS без изменений кода.
+
+# ----------------------------------------------------------------------------
+# Телеметрия самого агента (self_rules, см. описание формата правил (в README репозитория) разд. 5)
+# ----------------------------------------------------------------------------
+
+self_rules:
+  - uid: "ch.agent.rules.dataset_version"
+    title: "Rules dataset version in use"
+    source: internal
+    interval: 15m
+    thresholds: []
+    owner: "clickwatch"
+
+  - uid: "ch.agent.rules.dataset_age_hours"
+    title: "Rules dataset staleness"
+    source: internal
+    interval: 1h
+    thresholds:
+      - { metric: ruleset_age_hours, op: gte, value: 336, severity: warning }
+      - { metric: ruleset_age_hours, op: gte, value: 600, severity: critical }
+    owner: "clickwatch"
+
+  - uid: "ch.agent.rules.last_fetch_status"
+    title: "Last rules fetch outcome"
+    source: internal
+    interval: 15m
+    thresholds:
+      - { metric: last_fetch_status, op: gte, value: 2, severity: warning }
+    owner: "clickwatch"
+
+  - uid: "ch.agent.rules.last_fetch_age_hours"
+    title: "Hours since successful rules fetch"
+    source: internal
+    interval: 1h
+    thresholds:
+      - { metric: last_fetch_age_hours, op: gte, value: 4, severity: critical }
+    owner: "clickwatch"
+
+  - uid: "ch.agent.ch.unreachable_seconds"
+    title: "ClickHouse down on this node"
+    source: internal
+    interval: 1m
+    thresholds:
+      - { metric: unreachable_seconds, op: gte, value: 60,  severity: warning }
+      - { metric: unreachable_seconds, op: gte, value: 300, severity: critical }
+    owner: "clickwatch"
+
+  - uid: "ch.agent.access.denied_tables_count"
+    title: "System tables currently denied"
+    source: internal
+    interval: 15m
+    thresholds:
+      - { metric: denied_tables_count, op: gte, value: 1, severity: warning }
+    owner: "clickwatch"
+
+  - uid: "ch.agent.access.last_change_hours"
+    title: "Hours since last access change"
+    source: internal
+    interval: 1h
+    thresholds: []
+    owner: "clickwatch"
+
+  - uid: "ch.agent.status"
+    title: "Agent activity state (0 active, 1 dormant, 2 no-client)"
+    source: internal
+    interval: 15m
+    thresholds:
+      - { metric: agent_state, op: gte, value: 1, severity: critical }
+    owner: "clickwatch"
+
+  - uid: "ch.agent.time.drift_ms"
+    title: "ClickHouse vs agent clock drift"
+    source: internal
+    interval: 15m
+    thresholds:
+      - { metric: drift_ms, op: gte, value: 5000,  severity: warning }
+      - { metric: drift_ms, op: gte, value: 30000, severity: critical }
+    owner: "clickwatch"
+
+  - uid: "ch.agent.rules.yaml_updated_at"
+    title: "Epoch when rules.yaml was last reloaded"
+    source: internal
+    interval: 1h
+    thresholds: []
+    owner: "clickwatch"
+
+  - uid: "ch.agent.work.rows_collected_total"
+    title: "Lifetime rows collected counter"
+    source: internal
+    interval: 1h
+    thresholds: []
+    owner: "clickwatch"
