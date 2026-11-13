@@ -1,4 +1,4 @@
-# ch-agent — мониторинговый агент ClickHouse на Go
+# ch-agent — агент ClickWatch (Go)
 
 Один статический бинарник, который встаёт на ноду ClickHouse, исполняет встроенный
 набор правил из 48 точек контроля (копия `rules_default.yaml`, компилируется в
@@ -7,9 +7,11 @@
 пропускается статическими статусами `skipped_unsupported` / `skipped_table_missing`,
 а не ломает сбор.
 
-Спецификации, которым следует реализация: `rules_default_usage_spec.md`
-(жизненный цикл правил), `agent_yaml_spec.md` (конфигурация),
-`protocol_agent_saas_spec.md` (протокол), `rules_yaml_spec.md` (грамматика правил).
+Спецификации, которым следует реализация: 
+- `rules_default_usage_spec.md`(жизненный цикл правил), 
+- `agent_yaml_spec.md` (конфигурация),
+- `protocol_agent_saas_spec.md` (протокол), 
+- `rules_yaml_spec.md` (грамматика правил).
 
 ## Возможности
 
